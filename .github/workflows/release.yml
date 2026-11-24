@@ -34,9 +34,16 @@ jobs:
 
       - name: Package macOS app
         working-directory: web/electron
-        run: npx electron-builder --mac dmg
+        shell: bash
+        run: npx electron-builder --mac dmg 2>&1 | tee build.log; exit ${PIPESTATUS[0]}
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-buildlog
+          path: web/electron/build.log
 
       - uses: actions/upload-artifact@v4
         with:
@@ -72,7 +79,14 @@ jobs:
 
       - name: Package Windows app
         working-directory: web/electron
-        run: npx electron-builder --win
+        shell: bash
+        run: npx electron-builder --win 2>&1 | tee build.log; exit ${PIPESTATUS[0]}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-buildlog
+          path: web/electron/build.log
 
       - uses: actions/upload-artifact@v4
         with:

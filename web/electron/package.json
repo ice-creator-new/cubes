@@ -4,6 +4,7 @@
   "private": true,
   "version": "0.1.0",
   "description": "Cubes 桌面端：主管团队，在一个原生窗口里。",
+  "author": "SunFlyIce",
   "main": "main.cjs",
   "scripts": {
     "start": "sh scripts/start.sh",
@@ -60,7 +61,7 @@
       "title": "Cubes"
     }
   },
-  "dependencies": {
+  "optionalDependencies": {
     "electron-window-glass": "1.0.0"
   }
 }

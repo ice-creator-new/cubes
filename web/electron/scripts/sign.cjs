@@ -53,6 +53,8 @@ function ensureIdentity() {
 /** @param {{ appOutDir: string, packager: { appInfo: { productFilename: string, id: string } }, electronPlatformName: string }} context */
 exports.default = async function sign(context) {
   if (context.electronPlatformName !== "darwin") return;
+  // CI builds ship as-is: the local certificate only helps on the machine that made it.
+  if (process.env.CI) return;
   const appPath = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`);
   ensureIdentity();
   run("security", ["unlock-keychain", "-p", PASSWORD, KEYCHAIN]);
