@@ -29,7 +29,7 @@ jobs:
         shell: bash
         run: |
           perl -pi -e 's/\r$//' backend/scripts/build-desktop.sh
-          bash backend/scripts/build-desktop.sh 2>&1 | tee backend-build.log
+          bash -x backend/scripts/build-desktop.sh 2>&1 | tee backend-build.log
           exit ${PIPESTATUS[0]}
 
       - name: Build web
@@ -79,7 +79,7 @@ jobs:
         shell: bash
         run: |
           perl -pi -e 's/\r$//' backend/scripts/build-desktop.sh
-          bash backend/scripts/build-desktop.sh 2>&1 | tee backend-build.log
+          bash -x backend/scripts/build-desktop.sh 2>&1 | tee backend-build.log
           exit ${PIPESTATUS[0]}
 
       - name: Build web
@@ -118,7 +118,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::error::uname=$(uname -a) | uv=$(command -v uv || echo MISSING)"
-          echo "::error::FULLLOG $(tr '\n' '|' < backend-build.log 2>/dev/null | head -c 5000)"
+          echo "::error::FULLLOG $(tail -c 2500 backend-build.log 2>/dev/null | tr '\n' '|')"
 
       - uses: actions/upload-artifact@v4
         with:
