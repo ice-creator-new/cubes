@@ -530,7 +530,7 @@ async def _case_fetch_url_rejects_private_targets(tmp_path: Path) -> None:
             "loop.example": ["127.0.0.1"],
             "meta.example": ["169.254.169.254"],
             "v6.example": ["fd00::1"],
-            "mapped.example": ["::ffff:192.168.1.4"],
+            "mapped.example": ["::ffff:192.168.1.10"],
         }
     )
     with net.override_resolver(resolver):

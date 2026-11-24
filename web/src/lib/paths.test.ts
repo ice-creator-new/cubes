@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { shortenPathSummary } from "./paths";
 
-const ROOT = "/Users/sunflyice/Documents/AI-Native/cubes/cubes";
+const ROOT = "/Users/dev/Documents/AI-Native/cubes/cubes";
 
 describe("shortenPathSummary", () => {
   it("keeps the file name of a long write path and drops the leading folders", () => {
