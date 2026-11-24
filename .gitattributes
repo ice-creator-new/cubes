@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings on every platform — CRLF breaks bash on
+# Windows runners (`$'\r': command not found`) and in Git Bash generally.
+*.sh text eol=lf
+*.cjs text eol=lf
+*.yml text eol=lf
