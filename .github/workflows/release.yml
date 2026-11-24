@@ -27,7 +27,10 @@ jobs:
 
       - name: Build backend (PyInstaller)
         shell: bash
-        run: bash backend/scripts/build-desktop.sh 2>&1 | tee backend-build.log; exit ${PIPESTATUS[0]}
+        run: |
+          sed -i 's/\r$//' backend/scripts/build-desktop.sh
+          bash backend/scripts/build-desktop.sh 2>&1 | tee backend-build.log
+          exit ${PIPESTATUS[0]}
 
       - name: Build web
         working-directory: web
@@ -74,7 +77,10 @@ jobs:
 
       - name: Build backend (PyInstaller)
         shell: bash
-        run: bash backend/scripts/build-desktop.sh 2>&1 | tee backend-build.log; exit ${PIPESTATUS[0]}
+        run: |
+          sed -i 's/\r$//' backend/scripts/build-desktop.sh
+          bash backend/scripts/build-desktop.sh 2>&1 | tee backend-build.log
+          exit ${PIPESTATUS[0]}
 
       - name: Build web
         working-directory: web
@@ -111,6 +117,13 @@ jobs:
             file backend/scripts/build-desktop.sh 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::uname=$(uname -a)"
+          echo "::error::uv=$(command -v uv || echo MISSING)"
+          echo "::error::filetype=$(file backend/scripts/build-desktop.sh 2>/dev/null | tr ':' ' ')"
+          n=0
+          tail -15 backend-build.log 2>/dev/null | while IFS= read -r line; do
+            echo "::error::LOG $line"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
