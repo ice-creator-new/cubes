@@ -19,6 +19,14 @@ cd "$backend_dir"
 # IANA zones on machines whose OS has no zoneinfo database, so all three are collected too.
 # Pick the PyInstaller --add-data separator from the platform: ':' on POSIX, ';' on Windows.
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) DATA_SEP=";" ;; *) DATA_SEP=":" ;; esac
+# Windows Python (which runs PyInstaller) cannot read Git Bash POSIX paths like /d/a/...,
+# so translate them to native mixed form (D:/...) whenever we are on a Windows shell.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) native() { cygpath -m "$1"; } ;;
+  *) native() { printf '%s' "$1"; } ;;
+esac
+backend_native="$(native "$backend_dir")"
+work_native="$(native "$work")"
 uv run --python 3.12 \
   --with-requirements requirements.txt \
   --with-requirements requirements-build.txt \
@@ -27,17 +35,17 @@ uv run --python 3.12 \
   --clean \
   --onedir \
   --name cubes-backend \
-  --paths "$backend_dir" \
+  --paths "$backend_native" \
   --collect-all resvg_py \
   --collect-submodules uvicorn \
   --collect-submodules websockets \
   --collect-submodules croniter \
   --collect-submodules dateutil \
   --collect-data tzdata \
-  --add-data "$backend_dir/app/models_dev.json${DATA_SEP}app" \
-  --distpath "$work/dist" \
-  --workpath "$work/build" \
-  --specpath "$work" \
+  --add-data "${backend_native}/app/models_dev.json${DATA_SEP}app" \
+  --distpath "$work_native/dist" \
+  --workpath "$work_native/build" \
+  --specpath "$work_native" \
   desktop_main.py
 
 echo "backend bundle: $work/dist/cubes-backend"
