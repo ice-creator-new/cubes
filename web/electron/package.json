@@ -1,0 +1,66 @@
+{
+  "name": "cubes",
+  "productName": "Cubes",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Cubes 桌面端：主管团队，在一个原生窗口里。",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "sh scripts/start.sh",
+    "dist": "electron-builder --mac",
+    "dist:win": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "45.4.1",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "com.ice.cubes.desktop",
+    "productName": "Cubes",
+    "copyright": "Cubes",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.cjs",
+      "menu.cjs",
+      "preload.cjs",
+      "build/icon.png",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist",
+        "to": "web"
+      },
+      {
+        "from": "../../backend/build/desktop/dist/cubes-backend",
+        "to": "cubes-backend"
+      }
+    ],
+    "asar": true,
+    "asarUnpack": ["node_modules/electron-window-glass/dist/*.node"],
+    "afterSign": "scripts/sign.cjs",
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "build/icon.icns",
+      "target": [
+        "dir",
+        "dmg"
+      ],
+      "identity": null,
+      "hardenedRuntime": false,
+      "extendInfo": {
+        "NSScreenCaptureUsageDescription": "让机器人看到屏幕，才能替你点击和操作这台 Mac。",
+        "NSAppleEventsUsageDescription": "让机器人在你允许后操作其他 App。"
+      }
+    },
+    "dmg": {
+      "title": "Cubes"
+    }
+  },
+  "dependencies": {
+    "electron-window-glass": "1.0.0"
+  }
+}

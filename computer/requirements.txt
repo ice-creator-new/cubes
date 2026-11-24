@@ -1,0 +1,6 @@
+browser-use==0.13.11
+mss==10.2.0
+pillow==12.3.0
+# browser-use (via browser-harness) pins this exact version; the backend's 17.3 speaks the same
+# WebSocket protocol, so the agent and the backend need not match.
+websockets==15.0.1

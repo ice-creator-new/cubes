@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# The `cubes` console entry: run the backend's CLI with the backend virtualenv.
+# Make it reachable by putting this directory on PATH, or call it by path. From this
+# directory `python -m cubes_cli` does the same thing.
+set -euo pipefail
+
+backend_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -x "$backend_dir/.venv/bin/python" ]; then
+  exec "$backend_dir/.venv/bin/python" "$backend_dir/cubes_cli.py" "$@"
+fi
+exec python3 "$backend_dir/cubes_cli.py" "$@"

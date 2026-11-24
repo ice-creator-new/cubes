@@ -1,0 +1,2 @@
+# Build-only: PyInstaller freezes the backend into the desktop app. Never a runtime dependency.
+pyinstaller==6.22.3

@@ -1,0 +1,18 @@
+.DS_Store
+xcuserdata/
+*.xcuserstate
+DerivedData/
+.build/
+backend/.venv/
+backend/.env
+backend/data/
+__pycache__/
+.pytest_cache/
+.coverage
+.superpowers/
+web/node_modules/
+web/electron/node_modules/
+web/dist/
+web/electron/dist/
+# The frozen backend from backend/scripts/build-desktop.sh, copied into Cubes.app by electron-builder.
+backend/build/

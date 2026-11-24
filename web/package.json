@@ -1,0 +1,35 @@
+{
+  "name": "cubes-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "build:desktop": "bash ../backend/scripts/build-desktop.sh && npm run build && npm --prefix electron run dist",
+    "test": "vitest run",
+    "desktop": "sh electron/scripts/start.sh"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "2.1.10",
+    "highlight.js": "11.11.2",
+    "lowlight": "3.3.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "react-markdown": "10.1.0",
+    "rehype-katex": "7.0.1",
+    "remark-gfm": "4.0.1",
+    "remark-math": "6.0.0"
+  },
+  "devDependencies": {
+    "@types/hast": "3.0.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.4",
+    "vitest": "5.0.5"
+  }
+}
