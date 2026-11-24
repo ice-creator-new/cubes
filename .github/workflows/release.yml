@@ -93,6 +93,25 @@ jobs:
             web/electron/build.log
             backend-build.log
 
+      - name: Diagnose failure (debug blackbox)
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "## Windows build debug"
+            echo "- uname: $(uname -a)"
+            echo "- uv path: $(command -v uv || echo MISSING)"
+            echo "- bash: $BASH_VERSION"
+            echo "### backend-build.log (tail -60)"
+            echo '```'
+            tail -60 backend-build.log 2>/dev/null || echo "(no backend-build.log)"
+            echo '```'
+            echo "### file type check (CRLF?)"
+            echo '```'
+            file backend/scripts/build-desktop.sh 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v4
         with:
           name: windows-exe
