@@ -17,9 +17,8 @@ cd "$backend_dir"
 # only imported by uvicorn's WebSocket protocol (the sandbox's /computer/agent), so it is
 # collected the same way. croniter imports dateutil lazily for cron rules, and tzdata supplies
 # IANA zones on machines whose OS has no zoneinfo database, so all three are collected too.
-# Pick the PyInstaller --add-data separator from Python itself (os.pathsep):
-# ':' on POSIX, ';' on Windows — guessing it from `uname` is fragile.
-DATA_SEP=$(uv run --quiet --python 3.12 python -c "import os; print(os.pathsep)")
+# Pick the PyInstaller --add-data separator from the platform: ':' on POSIX, ';' on Windows.
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) DATA_SEP=";" ;; *) DATA_SEP=":" ;; esac
 uv run --python 3.12 \
   --with-requirements requirements.txt \
   --with-requirements requirements-build.txt \
