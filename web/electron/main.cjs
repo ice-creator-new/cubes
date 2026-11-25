@@ -12,7 +12,7 @@
 // CUBES_GLASS=0 drops the sidebar material (vibrancy, frosted or Liquid Glass) and transparency,
 // to measure that on its own.
 
-const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, net, protocol, shell } = require("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, net, os, protocol, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -278,6 +278,21 @@ handle("clear-remote", async () => {
   writeCliConfig(session);
   return describe();
 });
+/** The backdrop behind the web content: macOS vibrancy, Windows 11 acrylic, else a flat colour. */
+function windowMaterial() {
+  const flat = { backgroundColor: nativeTheme.shouldUseDarkColors ? "#17181c" : "#f3f2f0" };
+  if (!GLASS) return flat;
+  if (process.platform === "darwin") {
+    return { vibrancy: "sidebar", visualEffectState: "followWindow", backgroundColor: "#00000000" };
+  }
+  // backgroundMaterial needs Windows 11 (build 22000+); Windows 10 keeps the flat backdrop.
+  const build = Number(os.release().split(".")[2] || 0);
+  if (process.platform === "win32" && build >= 22000) {
+    return { backgroundMaterial: "acrylic", backgroundColor: "#00000000" };
+  }
+  return flat;
+}
+
 /** Windows: the caption buttons overlay the tab strip (there is no system title bar), tinted to
  *  match the strip's own band: --rail in styles.css, --ink for the glyphs. */
 function titleBarOverlay() {
@@ -439,9 +454,7 @@ function createWindow() {
           autoHideMenuBar: true,
         }),
     show: false,
-    ...(GLASS
-      ? { vibrancy: "sidebar", visualEffectState: "followWindow", backgroundColor: "#00000000" }
-      : { backgroundColor: nativeTheme.shouldUseDarkColors ? "#17181c" : "#f3f2f0" }),
+    ...windowMaterial(),
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,

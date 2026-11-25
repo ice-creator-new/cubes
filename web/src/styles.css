@@ -576,7 +576,8 @@ kbd {
    behind the web content, so a translucent rail reads as frosted glass. The chat pane stays
    opaque. This holds at every width: only a narrow window's opened rail, which floats over the
    chat rather than beside it, turns solid (below), since glass over the page would be unreadable. */
-:root[data-shell="mac"] body {
+:root[data-shell="mac"] body,
+:root[data-shell="desktop"] body {
   background: transparent;
 }
 
@@ -592,7 +593,8 @@ kbd {
   -webkit-app-region: no-drag;
 }
 
-:root[data-shell="mac"] .sidebar {
+:root[data-shell="mac"] .sidebar,
+:root[data-shell="desktop"] .sidebar {
   background: var(--rail-glass);
 }
 
@@ -4514,7 +4516,8 @@ button.author-line:hover .author-name {
    tint is painted once, by `.main.tabbed` (the frame behind both the strip and the page's rounded
    corners); the strip itself is clear over it, so there is never glass over glass and the corner
    gaps are exactly the strip's tone, in light and in dark. */
-:root[data-shell="mac"] .tab-bar {
+:root[data-shell="mac"] .tab-bar,
+:root[data-shell="desktop"] .tab-bar {
   --tab-band: transparent;
 }
 
@@ -4539,7 +4542,8 @@ button.author-line:hover .author-name {
   box-shadow: none;
 }
 
-:root[data-shell="mac"] .main.tabbed {
+:root[data-shell="mac"] .main.tabbed,
+:root[data-shell="desktop"] .main.tabbed {
   background: var(--rail-glass);
 }
 
