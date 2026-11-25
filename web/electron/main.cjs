@@ -278,8 +278,28 @@ handle("clear-remote", async () => {
   writeCliConfig(session);
   return describe();
 });
+/** Windows: the caption buttons overlay the tab strip (there is no system title bar), tinted to
+ *  match the strip's own band: --rail in styles.css, --ink for the glyphs. */
+function titleBarOverlay() {
+  return nativeTheme.shouldUseDarkColors
+    ? { color: "#1c1d22", symbolColor: "#ececf1", height: 40 }
+    : { color: "#ecebe8", symbolColor: "#1e1f22", height: 40 };
+}
+
+/** Keep the overlay tint in step with the app theme, and with the system one when following it. */
+function syncTitleBarOverlay() {
+  if (process.platform === "darwin" || !window || window.isDestroyed()) return;
+  try {
+    window.setTitleBarOverlay(titleBarOverlay());
+  } catch {
+    /* an Electron without overlay updates: the first tint simply stands */
+  }
+}
+nativeTheme.on("updated", syncTitleBarOverlay);
+
 handle("set-theme", (theme) => {
   nativeTheme.themeSource = theme === "light" || theme === "dark" ? theme : "system";
+  syncTitleBarOverlay();
 });
 handle("set-zoom", (factor) => window?.webContents.setZoomFactor(Math.min(3, Math.max(0.5, Number(factor) || 1))));
 handle("open-external", (url) => {
@@ -409,8 +429,15 @@ function createWindow() {
     minHeight: 520,
     title: "Cubes",
     icon: ICON,
-    titleBarStyle: "hiddenInset",
-    trafficLightPosition: { x: 18, y: 24 },
+    ...(process.platform === "darwin"
+      ? { titleBarStyle: "hiddenInset", trafficLightPosition: { x: 18, y: 24 } }
+      : {
+          // Windows: no system title bar. The native caption buttons overlay the tab strip
+          // (top right, exactly its 40px) and the menu tucks away behind Alt.
+          titleBarStyle: "hidden",
+          titleBarOverlay: titleBarOverlay(),
+          autoHideMenuBar: true,
+        }),
     show: false,
     ...(GLASS
       ? { vibrancy: "sidebar", visualEffectState: "followWindow", backgroundColor: "#00000000" }

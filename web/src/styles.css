@@ -4587,6 +4587,13 @@ button.author-line:hover .author-name {
   scrollbar-width: none;
 }
 
+/* Windows: the native caption buttons overlay the strip's right end (the window has no system
+   title bar), so the tabs stop short of them. `titlebar-area-width` is exact at any DPI; the
+   fallback keeps the same room should the overlay variables ever be missing. */
+:root[data-shell="desktop"] .tab-strip {
+  padding-right: calc(100vw - env(titlebar-area-width, calc(100vw - 138px)) + var(--tab-foot) + 4px);
+}
+
 .tab-strip::-webkit-scrollbar {
   display: none;
 }

@@ -2,7 +2,7 @@
   "name": "cubes",
   "productName": "Cubes",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Cubes 桌面端：主管团队，在一个原生窗口里。",
   "author": "SunFlyIce",
   "main": "main.cjs",
@@ -41,7 +41,9 @@
       }
     ],
     "asar": true,
-    "asarUnpack": ["node_modules/electron-window-glass/dist/*.node"],
+    "asarUnpack": [
+      "node_modules/electron-window-glass/dist/*.node"
+    ],
     "afterSign": "scripts/sign.cjs",
     "mac": {
       "category": "public.app-category.productivity",
