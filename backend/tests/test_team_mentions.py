@@ -79,6 +79,10 @@ def test_a_mentioned_member_replies_instead_of_the_supervisor(make_backend, upst
         assert "甲" in system
         assert "出方案" in system
         assert "乙" in system  # the group roster is visible to every member
+        # Scratch work goes under the working folder, and @ is only a real request.
+        assert "草稿/" in system
+        assert "不要为了让人批准" in system
+        assert "不要替用户决定" in system
         # The group turn sees the user's own words, mentions included.
         assert "群组里做一件活" not in system
         contents = [message["content"] for message in request["messages"]]
@@ -194,43 +198,45 @@ def test_explicit_mentions_beat_the_message_body(make_backend, upstream) -> None
     asyncio.run(body())
 
 
-def test_handoff_stops_after_eight_hops(make_backend, upstream) -> None:
+def test_relay_stops_after_two_hops_and_the_supervisor_concludes(make_backend, upstream) -> None:
     backend = make_backend()
     team = build_team(backend)
-
-    def alternating(requests, index):
-        return {"content": "@乙 继续" if index % 2 else "@甲 继续"}
-
-    upstream.script = [alternating]
+    upstream.script = [
+        {"content": "方案先这样，@乙 看下风险"},
+        {"content": "风险可控，@甲 你补个细节"},
+        {"content": "细节补好了，@乙 你确认下"},
+        {"content": "结论：方案已定；还需要你决定：什么时候上线？"},
+    ]
 
     async def body() -> None:
         async with client_for(backend) as client:
             run = await run_goal(client, team["group"]["id"], "@甲 开始接力")
-            assert run["status"] == "limited", run
-            assert run["error"] == "@ 接力已达 8 轮上限，已停止继续转交。"
-            assert run["hops"] == 8
+            assert run["status"] == "completed", run
+            assert run["hops"] == 2
             assert run["pending_agent_ids"] == []
             assert run["current_agent_id"] is None
-            assert run["model_calls"] == 9
+            # One turn per hop, then the supervisor's closing turn: never an endless relay.
+            assert run["model_calls"] == 4
 
             detail = await get_conversation(client, team["group"]["id"])
             replies = agent_messages(detail)
-            assert len(replies) == 9
+            assert len(replies) == 4
             assert all(reply["status"] == "complete" for reply in replies)
-            authors = [reply["author_id"] for reply in replies]
-            assert authors == [
+            assert [reply["author_id"] for reply in replies] == [
                 team["designer"]["id"],
                 team["reviewer"]["id"],
                 team["designer"]["id"],
-                team["reviewer"]["id"],
-                team["designer"]["id"],
-                team["reviewer"]["id"],
-                team["designer"]["id"],
-                team["reviewer"]["id"],
-                team["designer"]["id"],
+                team["supervisor"]["id"],
             ]
+            # No system notice line: the closing answer is the end of the run.
+            assert all(message["kind"] != "notice" for message in detail["messages"])
+            assert replies[-1]["content"].startswith("结论：")
 
-        assert upstream.request_count == 9
+        # The third hand-off was refused; the supervisor got the closing instruction instead.
+        assert upstream.request_count == 4
+        closing = upstream.requests[-1]["messages"][-1]["content"]
+        assert "不要再 @ 任何同事" in closing
+        assert "还需要用户决定什么" in closing
 
     asyncio.run(body())
 

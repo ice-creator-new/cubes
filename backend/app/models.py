@@ -478,6 +478,18 @@ class ReactionOut(BaseModel):
     actors: list[ReactionActorOut]
 
 
+class RouteIntentOut(BaseModel):
+    """One ask inside a user message that carried several, and who takes it."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    text: str = ""
+    kind: Literal["answer", "steer", "resume", "status", "invite"] = "answer"
+    speakers: list[str] = Field(default_factory=list)
+    task_id: str | None = None
+    invite: list[str] = Field(default_factory=list)
+
+
 class RouteOut(BaseModel):
     """Who answered one user message in a group, and by which rule.
 
@@ -489,10 +501,22 @@ class RouteOut(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     speakers: list[str] = Field(default_factory=list)
-    kind: Literal["answer", "steer", "resume", "status", "none"] = "answer"
+    kind: Literal["answer", "steer", "resume", "status", "invite", "none"] = "answer"
     task_id: str | None = None
     reason: str = ""
     by: Literal["dispatcher", "fallback", "mention", "user"] = "dispatcher"
+    # Still deciding: the hint reads 「正在决定谁来接」 and no speakers are known yet.
+    pending: bool = False
+    # A message with several asks: one entry per slice, in the order they were written.
+    # Absent on a single-ask message, so the older wire shape stays exactly as it was.
+    intents: list[RouteIntentOut] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def _route_shape(self, handler: Any) -> dict:
+        data = handler(self)
+        if not data.get("intents"):
+            data.pop("intents", None)
+        return data
 
 
 class StatusTaskOut(BaseModel):
@@ -514,6 +538,17 @@ class StatusCardOut(BaseModel):
 
     tasks: list[StatusTaskOut] = Field(default_factory=list)
     idle: list[str] = Field(default_factory=list)
+
+
+class InviteOut(BaseModel):
+    """A notice row that offers to pull one team agent into the group."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    agent_id: str
+    name: str
+    # The bot message whose @ asked for them; the invite re-answers that message.
+    message_id: str | None = None
 
 
 class MessageOut(BaseModel):
@@ -546,6 +581,8 @@ class MessageOut(BaseModel):
     reminder: bool = False
     # The group task a ``kind="task"`` card stands for; the client renders it from live tasks.
     task_id: str | None = None
+    # The bot turn (an activity) that wrote this row; a group hides those rows behind its card.
+    activity_id: str | None = None
     # Whether the model response that wrote this text also emitted tool calls. ``None`` on rows
     # written before the field existed and on non-agent rows; the client only guesses for those.
     leads_to_tools: bool | None = None
@@ -553,6 +590,15 @@ class MessageOut(BaseModel):
     # ``resume``, ``status`` or ``none``), and the progress card a ``kind="status"`` row carries.
     route: RouteOut | None = None
     status_card: StatusCardOut | None = None
+    # Set on a ``kind="notice"`` row that offers 「拉进群」 for someone the bot @-ed.
+    invite: InviteOut | None = None
+
+    @model_serializer(mode="wrap")
+    def _message_shape(self, handler: Any) -> dict:
+        data = handler(self)
+        if data.get("invite") is None:
+            data.pop("invite", None)
+        return data
 
 
 class ConversationOut(BaseModel):
@@ -613,6 +659,78 @@ class RunOut(BaseModel):
     created_at: str
     updated_at: str
     finished_at: str | None = None
+
+
+class ActivityOut(BaseModel):
+    """One bot's piece of work in one conversation: a turn, from its first word to its end.
+
+    ``steps`` is derived when it is read (tool calls plus the narration leading into them),
+    so a card's counter can never disagree with the transcript. ``parent_id`` names the
+    activity that caused this one; ``task_id`` is set when the turn works on a task thread.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    conversation_id: str
+    agent_id: str
+    agent_name: str
+    run_id: str | None = None
+    task_id: str | None = None
+    parent_id: str | None = None
+    title: str
+    summary: str = ""
+    status: Literal["running", "awaiting", "completed", "stopped", "error", "limited"]
+    current_step: str = ""
+    latest_text: str = ""
+    steps: int = 0
+    # The newest call's tool (``""`` before the first one): the card's icon matches its row's.
+    current_tool: str = ""
+    started_at: str
+    finished_at: str | None = None
+    request_message_id: str | None = None
+    answer_message_id: str | None = None
+
+
+class ActivityStepOut(BaseModel):
+    """One row of an activity's detail: a tool call, a narration line, a question, a hand-off."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    kind: Literal["tool", "note", "ask", "handoff"]
+    title: str
+    subtitle: str = ""
+    status: Literal["running", "completed", "error", "awaiting", "denied"] = "completed"
+    message_id: str
+    action_id: str | None = None
+    # A hand-off names the section it leads to (an ``ask_agent`` answer, a task thread).
+    target_activity_id: str | None = None
+    created_at: str
+
+
+class ActivitySectionOut(BaseModel):
+    """One bot turn's part of a detail page: its name, its rows and its steps, oldest first."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    label: str
+    agent_id: str
+    activity_id: str
+    messages: list[MessageOut] = Field(default_factory=list)
+    steps: list[ActivityStepOut] = Field(default_factory=list)
+
+
+class ActivityDetailOut(BaseModel):
+    """One activity as its own page: everything about it, plus the turns it caused."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    activity: ActivityOut
+    conversation_title: str = ""
+    answer: MessageOut | None = None
+    sections: list[ActivitySectionOut] = Field(default_factory=list)
 
 
 class WorkflowStepOut(BaseModel):
@@ -1469,6 +1587,18 @@ class RerouteRequest(BaseModel):
     speakers: list[str] = Field(min_length=1)
 
 
+class InviteRequest(BaseModel):
+    """``POST /conversations/{id}/invite``: confirm a notice's 「拉进群」."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str
+    # The message whose @ asked for them (a bot reply); the invited bot answers it.
+    message_id: str | None = None
+    # The notice that offered the button, so the card disappears once it is done.
+    notice_id: str | None = None
+
+
 class ConversationPatchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1989,6 +2119,14 @@ def conversation_payload(raw: dict) -> dict:
 
 def run_payload(raw: dict) -> dict:
     return RunOut.model_validate(raw).model_dump(mode="json")
+
+
+def activity_payload(raw: dict) -> dict:
+    return ActivityOut.model_validate(raw).model_dump(mode="json")
+
+
+def activity_detail_payload(raw: dict) -> dict:
+    return ActivityDetailOut.model_validate(raw).model_dump(mode="json")
 
 
 def sidebar_payload(layout: dict) -> dict:

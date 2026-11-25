@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .. import schedules, usage as usage_rules
@@ -20,6 +20,9 @@ from .db import _UNSET, _json_object, now_iso
 
 TEAM_SETTINGS_KEY = "team_settings"
 PERMISSION_SETTINGS_KEY = "permission_settings"
+# A small ring of recent dispatch failures, newest last; the settings sheet shows a summary.
+DISPATCH_HEALTH_KEY = "dispatch_health"
+DISPATCH_HEALTH_LIMIT = 50
 
 SEND_MODES = ("steer", "queue", "interrupt")
 
@@ -100,6 +103,62 @@ class Team:
     def step_budget(self) -> str:
         """The workspace's step preset alone: a per-call budget check must stay one small read."""
         return str(self._stored_team_settings()["step_budget"])
+
+    # ------------------------------------------------------------------ dispatch health
+
+    def record_dispatch_failure(self, kind: str) -> None:
+        """Remember one routing failure (TimeoutError/UpstreamError/Unreadable), last 50 kept."""
+        if kind not in ("TimeoutError", "UpstreamError", "Unreadable"):
+            return
+        with self._transaction() as tx:
+            raw = self._meta(tx, DISPATCH_HEALTH_KEY)
+            try:
+                rows = json.loads(raw) if raw else []
+            except ValueError:
+                rows = []
+            if not isinstance(rows, list):
+                rows = []
+            rows.append({"kind": kind, "at": now_iso()})
+            self._meta_set(
+                tx,
+                DISPATCH_HEALTH_KEY,
+                json.dumps(rows[-DISPATCH_HEALTH_LIMIT:], ensure_ascii=False),
+            )
+
+    def dispatch_health(self) -> dict[str, Any]:
+        """The last day's routing failures: count, the newest kind, and when it happened."""
+        conn = self._ensure()
+        with self._lock:
+            raw = self._meta(conn, DISPATCH_HEALTH_KEY)
+        try:
+            rows = json.loads(raw) if raw else []
+        except ValueError:
+            rows = []
+        if not isinstance(rows, list):
+            rows = []
+        now = datetime.now(timezone.utc)
+        failures = 0
+        last: dict[str, Any] | None = None
+        for row in reversed(rows):
+            if not isinstance(row, dict):
+                continue
+            at = str(row.get("at") or "")
+            kind = str(row.get("kind") or "")
+            if kind not in ("TimeoutError", "UpstreamError", "Unreadable") or not at:
+                continue
+            if last is None:
+                last = {"kind": kind, "at": at}
+            try:
+                when = datetime.fromisoformat(at.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if now - when <= timedelta(days=1):
+                failures += 1
+        return {
+            "failures_24h": failures,
+            "last_error": None if last is None else last["kind"],
+            "last_at": None if last is None else last["at"],
+        }
 
     def _stored_team_settings(self) -> dict[str, Any]:
         conn = self._ensure()

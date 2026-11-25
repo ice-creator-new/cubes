@@ -514,11 +514,10 @@ async def _create_group(ctx, payload: dict[str, Any]) -> ToolOutcome:
 
 
 def _kick_off(ctx, group: dict, first_message: str) -> dict:
-    """Post the supervisor's opening in the new group, then let the members answer it.
+    """Post the creator's one-line opening in the new group; the members stay quiet.
 
-    The run is started without a new user message: the opening is the trigger, and the
-    members' queue is the group's own members (side by side), not a dispatcher call — there
-    is no user message to route yet.
+    A group's first real message is the user's, and it goes through the dispatcher like
+    any other. Asking every member to introduce itself here produced a wall of intros.
     """
     boss = resolve.supervisor(ctx.store)
     roster = resolve.roster(ctx.store, group)
@@ -535,9 +534,6 @@ def _kick_off(ctx, group: dict, first_message: str) -> dict:
     )
     ctx.publish_message("message_start", message)
     ctx.publish_message("message_end", message)
-    kickoff = ctx.kick_off
-    if kickoff is not None:
-        kickoff(group, message)
     return group
 
 

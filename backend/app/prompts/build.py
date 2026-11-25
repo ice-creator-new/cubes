@@ -29,6 +29,7 @@ from .text import (
     MOOD_RULE,
     REACT_RULE,
     PRIVATE_NOTIFY_RULE,
+    RELAY_CONCLUSION_RULE,
     SKILLS_SAFETY_RULE,
     SKILLS_USE_RULE,
     START_TASK_RULE,
@@ -463,6 +464,75 @@ def closing_instruction(content: str, spoke: Sequence[str], author: str | None =
         "点出分歧，或者给一个简短的建议。一到三句话，不要逐个复述大家说了什么，不要写总结清单。"
         + asker
     )
+
+
+def relay_conclusion_instruction(content: str, spoke: Sequence[str]) -> str:
+    """The last turn after a spent bot-to-bot relay closes with a conclusion for the user."""
+    names = "、".join(f"「{name}」" for name in spoke)
+    said = f"{names}已经接过一轮。" if names else ""
+    return f"群里刚才停在：{content}\n\n{said}{RELAY_CONCLUSION_RULE}"
+
+
+def intent_focus_instruction(text: str, others: Sequence[str] = ()) -> str:
+    """One bot's slice of a user message that carried several asks.
+
+    The note rides as the turn's final user line, so the bot answers its part and lets the
+    other slices stay with whoever the dispatcher gave them to.
+    """
+    shared = "、".join(f"「{name}」" for name in others)
+    tail = f"这条消息的其他部分已经交给 {shared}。" if shared else ""
+    return (
+        f"（用户这条消息里交给你的部分：{text}。{tail}"
+        "只回答、只做你这一部分，不要替别人做，也不要把别人那部分再复述一遍。）"
+    )
+
+
+def invite_instruction(names: Sequence[str], text: str) -> str:
+    """The supervisor's invitation turn: pull someone in, say why, hand them the slice."""
+    listed = "、".join(f"「{name}」" for name in names)
+    return (
+        f"（用户这条消息需要 {listed} 来做，但还不在本群：先用 set_group_members 把人拉进来，"
+        f"用一句话说明为什么拉；然后由对方接手这一部分：{text}。"
+        "拉进来之后就结束你这一轮，不要替对方回答。）"
+    )
+
+
+def invited_focus_instruction(text: str, names: Sequence[str] = ()) -> str:
+    """The invited bot's turn: it is new here, answer the slice it was brought in for."""
+    asked = "、".join(f"「{name}」" for name in names)
+    why = f"{asked}把你拉进了这个群。" if asked else "你刚被拉进这个群。"
+    return (
+        f"（{why}用户这条消息里交给你的部分：{text}。"
+        "直接回答、做这一部分；不熟悉群里的历史就按用户这句话来。）"
+    )
+
+
+def bot_invite_instruction(
+    asker: str, names: Sequence[str], sentence: str
+) -> str:
+    """The supervisor pull-in turn when a member's reply @-ed a team agent outside the group."""
+    listed = "、".join(f"「{name}」" for name in names)
+    quote = " ".join(sentence.split())[:200]
+    return (
+        f"（「{asker}」在群里 @ 了 {listed}，但对方还不在本群。原话：{quote}\n"
+        f"先用 set_group_members 把 {listed} 拉进来，用一句话说明为什么拉；"
+        "拉进来之后就结束你这一轮，由对方接着回答。）"
+    )
+
+
+def bot_invited_focus_instruction(asker: str, sentence: str) -> str:
+    """The invited bot's turn after a member's @ brought it into the group."""
+    quote = " ".join(sentence.split())[:200]
+    return (
+        f"（你刚被拉进这个群：「{asker}」@ 了你，原话：{quote}\n"
+        "直接回答被 @ 的这件事，不要客套，也不要重复群里的历史。）"
+    )
+
+
+def stop_line(summary: str | None = None) -> str:
+    """The one short line a stopped turn leaves when it had tool steps but no answer."""
+    detail = " ".join(str(summary or "").split())
+    return f"已停下：{detail}" if detail else "已停下：还没有结论"
 
 
 def supervisor_system(

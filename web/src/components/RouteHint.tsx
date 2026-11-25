@@ -13,12 +13,15 @@ export function RouteHint({
   message,
   conversationID,
   members,
+  agents,
   taskTitleOf,
 }: {
   message: Message;
   conversationID: string;
   /** The group's members, in roster order, for the popover's checkboxes. */
   members: Agent[];
+  /** Every team agent, so an invite can name someone who is not in the group yet. */
+  agents?: Agent[];
   taskTitleOf: (taskID: string) => string | undefined;
 }) {
   const route = message.route;
@@ -26,6 +29,7 @@ export function RouteHint({
   const [chosen, setChosen] = useState<Set<string>>(() => new Set());
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [allLines, setAllLines] = useState(false);
   const shell = useRef<HTMLSpanElement>(null);
   const popover = usePresence(open ? true : null, 140);
   useEffect(() => {
@@ -46,7 +50,7 @@ export function RouteHint({
   if (!route) return null;
   const hint = routeHint(
     route,
-    (id) => members.find((agent) => agent.id === id)?.name,
+    (id) => (agents ?? members).find((agent) => agent.id === id)?.name,
     taskTitleOf,
   );
   const openPopover = () => {
@@ -64,6 +68,9 @@ export function RouteHint({
   };
   // The chosen order follows the roster, not the clicks: the dispatcher's speakers read the same.
   const speakers = members.filter((agent) => chosen.has(agent.id)).map((agent) => agent.id);
+  const lines = hint.lines ?? [];
+  const shown = allLines ? lines : lines.slice(0, 3);
+  const more = lines.length - shown.length;
   const reroute = async () => {
     if (speakers.length === 0 || sending) return;
     setSending(true);
@@ -76,17 +83,51 @@ export function RouteHint({
 
   return (
     <span className="route-hint-shell" ref={shell}>
-      <button
-        type="button"
-        className={`route-hint ${route.kind}`}
-        title={hint.title}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        aria-label={`${hint.text}。${hint.title}。点击改派`}
-        onClick={() => (open ? setOpen(false) : openPopover())}
-      >
-        {hint.text}
-      </button>
+      {route.pending ? (
+        // Routing is still running: one quiet line with three dots, nothing to click yet.
+        <span className="route-hint pending" role="status" aria-live="polite">
+          {hint.text}
+          <span className="pending-dots" aria-hidden="true">
+            <i />
+            <i />
+            <i />
+          </span>
+        </span>
+      ) : (
+        <span className="route-hint-stack">
+          <button
+            type="button"
+            className={`route-hint ${route.kind}${lines.length ? " multi" : ""}`}
+            title={hint.title}
+            aria-haspopup="dialog"
+            aria-expanded={open}
+            aria-label={`${lines.join("；") || hint.text}。${hint.title}。点击改派`}
+            onClick={() => (open ? setOpen(false) : openPopover())}
+          >
+            {lines.length ? (
+              <span className="route-hint-lines">
+                {shown.map((line, index) => (
+                  <span className="route-hint-line" key={index}>
+                    {line}
+                  </span>
+                ))}
+              </span>
+            ) : (
+              hint.text
+            )}
+          </button>
+          {more > 0 && (
+            <button
+              type="button"
+              className="route-hint-more"
+              onClick={() => setAllLines(true)}
+              aria-label={`展开其余 ${more} 件`}
+            >
+              还有 {more} 件
+            </button>
+          )}
+        </span>
+      )}
       {popover.value && (
         <div className={popover.open ? "route-pop" : "route-pop closing"} role="dialog" aria-label="改派这条消息">
           <div className="route-pop-head">谁来回答</div>

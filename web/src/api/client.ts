@@ -2,6 +2,8 @@
 
 import { SSEParser } from "./sse";
 import type {
+  ActivitiesPage,
+  ActivityDetail,
   GroupTask,
   Action,
   Agent,
@@ -93,8 +95,9 @@ const EVENT_NAMES: Record<string, true> = {
   context: true,
   workflows: true,
   workflow_run: true,
-  message_removed: true,
+  "message_removed": true,
   decisions: true,
+  activity: true,
 };
 
 export class ApiError extends Error {
@@ -358,6 +361,15 @@ export class ApiClient {
       "POST",
       `conversations/${encodeURIComponent(conversationID)}/messages/${encodeURIComponent(messageID)}/reroute`,
       { speakers },
+    );
+  }
+
+  /** Pulls a team agent into a group and lets them answer the message that @-ed them. */
+  inviteMember(conversationID: string, agentID: string, messageID: string | null, noticeID: string) {
+    return this.request<{ conversation_id?: string; id?: string; member_ids?: string[] }>(
+      "POST",
+      `conversations/${encodeURIComponent(conversationID)}/invite`,
+      { agent_id: agentID, message_id: messageID, notice_id: noticeID },
     );
   }
 
@@ -913,6 +925,25 @@ export class ApiClient {
       undefined,
       signal,
     );
+  }
+
+  /** One bot's pieces of work, across every conversation, newest first. */
+  agentActivities(id: string, page?: { limit?: number; before?: string | null }, signal?: AbortSignal) {
+    const params = new URLSearchParams();
+    if (page?.limit !== undefined) params.set("limit", String(page.limit));
+    if (page?.before) params.set("before", page.before);
+    const query = params.toString();
+    return this.request<ActivitiesPage>(
+      "GET",
+      `agents/${encodeURIComponent(id)}/activities${query ? `?${query}` : ""}`,
+      undefined,
+      signal,
+    );
+  }
+
+  /** One activity with its answer and its steps, sections labelled. */
+  activityDetail(id: string, signal?: AbortSignal) {
+    return this.request<ActivityDetail>("GET", `activities/${encodeURIComponent(id)}`, undefined, signal);
   }
 
   /** Hand-set status and/or progress note; the server answers with the updated task. */

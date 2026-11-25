@@ -9,7 +9,7 @@ import { memoriesByMessage } from "../lib/memories";
 import { agentModelLabel } from "../lib/modelOptions";
 import type { Mood } from "../lib/mood";
 import { openExternally, openWebURL } from "../lib/links";
-import { prefersReducedMotion, usePresence } from "../lib/motion";
+import { prefersReducedMotion, usePresence, useSecondTick } from "../lib/motion";
 import {
   buildTimeline,
   commentaryBlocks,
@@ -25,6 +25,7 @@ import {
   type ReplyTarget,
   type TimelineRow,
 } from "../lib/turns";
+import { groupPlan, isLiveActivity } from "../lib/activities";
 import { taskByID, threadHeading } from "../lib/threads";
 import {
   elapsedMs,
@@ -51,10 +52,13 @@ import type { RunRef } from "../lib/tabs";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { Dialog, Modal } from "./Dialog";
 import { Avatar, GroupAvatar } from "./Avatar";
+import { ActivitySlotView } from "./ActivityCard";
+import { TOOL_ICON } from "../lib/toolIcons";
+import { AuthorLine } from "./AuthorLine";
 import { Composer } from "./Composer";
 import { ConnectorMark } from "./ConnectorMark";
 import { ImageGrid, MessageAttachments } from "./Images";
-import { Icon, type IconName } from "./Icon";
+import { Icon } from "./Icon";
 import { MessageBody } from "./MessageBody";
 import { openEmojiSheet, ReactionsRow } from "./Reactions";
 import { WorkflowPanel } from "./WorkflowPanel";
@@ -83,54 +87,6 @@ function connectorPresetOf(toolName: string, connectors: ConnectorsState | null)
   return connectors?.connectors.find((connector) => connector.slug === slug)?.preset ?? "mcp";
 }
 
-/** Glyphs for the action rows; anything unknown falls back to a quiet info mark. */
-export const TOOL_ICON: Record<string, IconName> = {
-  create_agent: "plus",
-  create_group: "team",
-  set_group_members: "team",
-  post_group_message: "chat",
-  ask_agent: "chat",
-  web_search: "globe",
-  fetch_url: "link",
-  search_history: "history",
-  read_conversation: "chat",
-  note_create: "notebook",
-  note_update: "notebook",
-  note_delete: "trash",
-  note_read: "notebook",
-  note_list: "notebook",
-  task_create: "tasks",
-  task_update: "tasks",
-  task_list: "tasks",
-  current_time: "clock",
-  calculate: "calc",
-  convert_units: "units",
-  file_list: "files",
-  file_read: "file",
-  file_write: "save",
-  run_code: "terminal",
-  direct_message: "chat",
-  ask_group: "team",
-  ask_user: "chat",
-  update_self: "smiley",
-  update_agent: "team",
-  run_subtasks: "branch",
-  delete_agent: "trash",
-  dissolve_group: "team",
-  notify_user: "announce",
-  token_budget: "shield",
-  review: "review",
-  computer: "computer",
-  computer_shell: "terminal",
-  computer_browser: "globe",
-  view_image: "image",
-  schedule_computer: "computer",
-  use_skill: "skills",
-  read_skill_file: "file",
-  skill_create: "skills",
-  skill_to_computer: "computer",
-};
-
 const SUGGESTIONS = [
   "帮我调研一个产品方向，组建合适的团队给出结论",
   "把这个目标拆成几步，并安排成员分别完成",
@@ -147,6 +103,8 @@ export function ChatView({
   onClosePrivate,
   onOpenRun,
   onOpenWorkflows,
+  onOpenActivity,
+  onOpenWorkLog,
 }: {
   conversationID: string;
   /** Opened from another conversation, not by the window coming up: fade the column in. */
@@ -161,6 +119,10 @@ export function ChatView({
   onOpenRun: (run: RunRef) => void;
   /** Opens the 工作流 panel from the floating flow. */
   onOpenWorkflows: () => void;
+  /** Opens one bot's work detail: a card, a chip, or a row of the work log. */
+  onOpenActivity: (activityID: string) => void;
+  /** Opens one bot's whole work log, from its right-click menu. */
+  onOpenWorkLog: (agentID: string) => void;
 }) {
   const state = useTeam((s) => s);
   // Read once: the class belongs to this mounting, not to whatever the parent renders later.
@@ -440,6 +402,9 @@ export function ChatView({
 
   const arrivals = useArrivals(detail);
   const roster = isGroup ? members : [];
+  const outside = isGroup && conversation
+    ? (workspace?.agents ?? []).filter((agent) => !conversation.member_ids.includes(agent.id))
+    : [];
   const memberNames = useMemo(() => (workspace?.agents ?? []).map((a) => a.name), [workspace]);
   const openByName = (name: string) => {
     const agent = workspace?.agents.find((a) => a.name === name);
@@ -498,6 +463,8 @@ export function ChatView({
           excerpt: quoteExcerpt(anchor.text, 120),
         }),
       onOpenRun,
+      agentOf: (agentID) => state.workspace?.agents.find((agent) => agent.id === agentID),
+      onOpenWorkLog,
       // The sheet lives at the app's root: opening it must not re-render this conversation.
       onReact: (messageID) =>
         openEmojiSheet({
@@ -748,6 +715,7 @@ export function ChatView({
               onOpenMember={onOpenMember}
               onOpenConversation={onOpenConversation}
               onOpenMemories={onOpenMemories}
+              onOpenActivity={onOpenActivity}
               onReply={(target) => store.startReply(conversationID, target)}
               onJump={jumpTo}
               flashID={flash}
@@ -898,6 +866,7 @@ export function ChatView({
           <Composer
             conversationID={conversationID}
             roster={roster}
+            outside={outside}
             run={run}
             placeholder={placeholder}
             autoFocus
@@ -1018,6 +987,10 @@ function messageMenu(
     onOpenRun: (run: RunRef) => void;
     /** Open the emoji panel for this message's id, at the pointer. */
     onReact: (messageID: string) => void;
+    /** The bot behind an author id, for the 工作记录 item. */
+    agentOf: (agentID: string) => Agent | undefined;
+    /** Open one bot's whole work log. */
+    onOpenWorkLog: (agentID: string) => void;
   },
 ): MenuItem[] {
   const items: MenuItem[] = [];
@@ -1070,6 +1043,11 @@ function messageMenu(
       items.push({ label: "表情回应", icon: "smiley", onSelect: () => context.onReact(message.id) });
     }
   }
+  // A bot's row (its face, its answer, its tool row) also offers its whole work log.
+  const author = message?.author_id ? context.agentOf(message.author_id) : undefined;
+  if (author) {
+    items.push({ label: "工作记录", icon: "history", onSelect: () => context.onOpenWorkLog(author.id) });
+  }
   return items;
 }
 
@@ -1110,6 +1088,8 @@ export function Timeline({
   onOpenMember,
   onOpenConversation,
   onOpenMemories,
+  onOpenActivity,
+  onHandoff,
   onReply,
   onJump,
   flashID,
@@ -1129,6 +1109,12 @@ export function Timeline({
   onOpenConversation: (id: string) => void;
   /** Opens the 记忆 panel from a reply's chip. */
   onOpenMemories: () => void;
+  /** Opens one activity's detail sheet, from its card or its chip. A read-only record (a
+   *  scheduled run, a task card's peek) leaves it out and keeps the full steps instead. */
+  onOpenActivity?: (id: string) => void;
+  /** A hand-off row (ask_agent, start_task, group_assign, direct_message) in a record:
+   *  return true when the record opened the section it led to, else the row keeps its default. */
+  onHandoff?: (message: Message) => boolean;
   onReply: (target: ReplyTarget) => void;
   /** Scroll to one message and mark it briefly (the quote line above a user bubble). */
   onJump: (messageID: string) => void;
@@ -1153,11 +1139,40 @@ export function Timeline({
   const byID: Record<string, Message> = Object.fromEntries(
     [...detail.references, ...detail.messages].map((m) => [m.id, m]),
   );
+  // A group shows one bot's work as a card while it runs and a chip above its answer: every row
+  // written inside an activity folds away, except the consent cards the user acts on.
+  const openActivity = onOpenActivity ?? (() => undefined);
+  const groupChat = detail.conversation.kind === "group" && onOpenActivity !== undefined;
+  const plan = useMemo(
+    () => (groupChat ? groupPlan(detail.messages, state.activities, detail.conversation.id) : null),
+    [groupChat, detail.messages, detail.conversation.id, state.activities],
+  );
+  const messages = plan?.messages ?? detail.messages;
+  const activities = state.activities;
+  // A reload reads the rows before any event, so an activity the chat names is read on demand.
+  useEffect(() => {
+    for (const slot of plan?.slots ?? []) {
+      if (!activities[slot.activityID]) void store.loadActivity(slot.activityID);
+    }
+  }, [plan, activities]);
+  // A finished chip rides inside the answer's own article, right under the author line; a live
+  // card and a finished one with no answer stand where the activity's rows were.
+  const chipsAt = new Map<string, string[]>();
+  const standalone = new Map<number, string[]>();
+  for (const slot of plan?.slots ?? []) {
+    const activity = activities[slot.activityID];
+    const answer = activity?.answer_message_id ?? null;
+    if (activity && !isLiveActivity(activity.status) && answer !== null && messages.some((m) => m.id === answer)) {
+      chipsAt.set(answer, [...(chipsAt.get(answer) ?? []), slot.activityID]);
+      continue;
+    }
+    standalone.set(slot.at, [...(standalone.get(slot.at) ?? []), slot.activityID]);
+  }
   // Spacing, author lines and the single tools row of each reply.
-  const rows = buildTimeline(detail.messages, { privateChat, running });
+  const rows = buildTimeline(messages, { privateChat, running });
   // Which finished replies left a memory behind, by the id of the message that wrote it.
   const memoryIndex = memoriesByMessage(state.memories?.memories ?? []);
-  const spans = new Map(computerSpans(detail.messages, { privateChat }).map((span) => [span.start, span]));
+  const spans = new Map(computerSpans(messages, { privateChat }).map((span) => [span.start, span]));
   // Sandbox sessions keep their own shape: a note inside one is not running commentary.
   const folded = new Set<number>();
   for (const span of spans.values()) {
@@ -1199,7 +1214,10 @@ export function Timeline({
       // A system note (a model switch): quiet, centered, no bubble and no author line.
       return (
         <div key={message.id} className={rowClass("turn notice", message.id)} data-message-id={message.id}>
-          <p className="notice-line">{message.content}</p>
+          <p className="notice-line">
+            {message.content}
+            <InviteNoticeButton conversationID={detail.conversation.id} message={message} />
+          </p>
         </div>
       );
     }
@@ -1255,6 +1273,7 @@ export function Timeline({
               message={message}
               conversationID={detail.conversation.id}
               members={workspaceAgents.filter((agent) => detail.conversation.member_ids.includes(agent.id))}
+              agents={workspaceAgents}
               taskTitleOf={(taskID) =>
                 state.groupTasks[detail.conversation.id]?.find((task) => task.id === taskID)?.title
               }
@@ -1291,6 +1310,7 @@ export function Timeline({
           continues={continues}
           onOpenMember={onOpenMember}
           onOpenConversation={onOpenConversation}
+          onHandoff={onHandoff}
         />
       );
       if (!showAuthor) return row;
@@ -1363,6 +1383,17 @@ export function Timeline({
             onOpen={agent ? () => onOpenMember(agent.id) : undefined}
           />
         )}
+        {/* How the bot got to this answer, collapsed to one line: the steps are one click away. */}
+        {(chipsAt.get(message.id) ?? []).map((id) => (
+          <ActivitySlotView
+            key={`activity-${id}`}
+            activity={activities[id]}
+            activityID={id}
+            agent={undefined}
+            showAuthor={false}
+            onOpen={openActivity}
+          />
+        ))}
         {/* The reply is a bubble of its own, so a long answer reads as one block; its pills ride
             the bottom edge. Nothing to show yet (a call that opened only tools) keeps no bubble. */}
         <div className="bubble-stack">
@@ -1459,9 +1490,35 @@ export function Timeline({
     if (COMPUTER_TOOLS.has(action.tool_name)) return false;
     return !(action.tool_name === "workflow_run" && action.target_conversation_id !== null);
   };
+  /** A live card, or a finished one that left no answer, stands where its rows would have been. */
+  const pushActivitySlots = (at: number) => {
+    for (const id of standalone.get(at) ?? []) {
+      const activity = activities[id];
+      // Before the payload lands, the turn's own rows still name the speaker: the card must
+      // never show a blank face (a grey placeholder) for a bot that is working.
+      const owner = detail.messages.find((message) => message.activity_id === id);
+      const authorID = activity?.agent_id ?? owner?.author_id ?? null;
+      const agent = authorID ? workspaceAgents.find((item) => item.id === authorID) : undefined;
+      const before = messages[at - 1];
+      const continues = Boolean(before && authorID && before.author_id === authorID);
+      out.push(
+        <ActivitySlotView
+          key={`activity-${id}`}
+          activity={activity}
+          activityID={id}
+          agent={agent}
+          fallbackName={activity?.agent_name ?? owner?.author_name}
+          fallbackSeed={owner?.avatar_seed}
+          showAuthor={!continues}
+          onOpen={openActivity}
+        />,
+      );
+    }
+  };
   for (let index = 0; index < rows.length; index += 1) {
     const span = spans.get(index);
     const row = rows[index]!;
+    pushActivitySlots(index);
     if (swallowed.has(index)) continue;
     if (row.showAuthor) tailWaiting = true;
     const head = tailWaiting && bubbleShown(row);
@@ -1560,19 +1617,9 @@ export function Timeline({
     );
     index = span.end;
   }
+  // Work that has not written a row yet: its card waits at the end, where its rows will land.
+  pushActivitySlots(rows.length);
   return <>{out}</>;
-}
-
-/** A clock that only ticks while a task is live, so a resting card does not re-render. */
-function useSecondTick(active: boolean): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!active) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [active]);
-  return now;
 }
 
 /** Elapsed work time in the card's header; terminal cards freeze at their last update. */
@@ -2154,11 +2201,14 @@ function ActionRow({
   continues,
   onOpenMember,
   onOpenConversation,
+  onHandoff,
 }: {
   message: Message;
   continues: boolean;
   onOpenMember: (id: string) => void;
   onOpenConversation: (id: string) => void;
+  /** A record's hand-off row: true when it opened the section it led to. */
+  onHandoff?: (message: Message) => boolean;
 }) {
   const conversations = useTeam((s) => s.workspace?.conversations);
   const agents = useTeam((s) => s.workspace?.agents);
@@ -2212,7 +2262,9 @@ function ActionRow({
         <RelayMarker
           relay={{ conversation_id: privateID, direction: "out", peer_id: peerID, peer_name: peerName }}
           label={action.status === "running" ? "正在私信" : undefined}
-          onOpen={() => onOpenConversation(privateID)}
+          onOpen={() => {
+            if (onHandoff?.(message) !== true) onOpenConversation(privateID);
+          }}
         />
       </div>
     );
@@ -2227,7 +2279,13 @@ function ActionRow({
     const running = walk !== undefined && isLive(walk.status);
     return (
       <div className={blockClass(settling === "resolved" && "resolved")}>
-        <button type="button" className="wf-entry" onClick={() => onOpenConversation(walkPage)}>
+        <button
+          type="button"
+          className="wf-entry"
+          onClick={() => {
+            if (onHandoff?.(message) !== true) onOpenConversation(walkPage);
+          }}
+        >
           <span className={`wf-entry-dot${running ? " is-live" : ""}`} aria-hidden="true" />
           <span className="wf-entry-text">{action?.summary || message.content}</span>
           {walk && running && (
@@ -2304,6 +2362,8 @@ function ActionRow({
         aria-expanded={expandable && !navigable ? expanded : undefined}
         aria-controls={expandable && !navigable ? panelID : undefined}
         onClick={() => {
+          // A record's hand-off opens the section it led to, ahead of any target of its own.
+          if (onHandoff?.(message) === true) return;
           if (navigable) {
             if (openTarget) onOpenConversation(openTarget);
             else if (member) onOpenMember(member);
@@ -2816,44 +2876,6 @@ function OriginLine({ origin, onOpen }: { origin: Origin; onOpen: () => void }) 
   );
 }
 
-function AuthorLine({
-  agent,
-  fallbackName,
-  fallbackSeed,
-  mood,
-  note,
-  onOpen,
-}: {
-  agent: Agent | undefined;
-  fallbackName?: string;
-  fallbackSeed?: string | null;
-  mood: Mood;
-  note?: string;
-  onOpen?: () => void;
-}) {
-  const name = agent?.name ?? fallbackName ?? "成员";
-  const content = (
-    <>
-      <Avatar
-        seed={agent?.avatar_seed ?? fallbackSeed}
-        appearance={agent?.appearance}
-        size={24}
-        name={name}
-        mood={mood}
-      />
-      <span className="author-name">{name}</span>
-      {note && <span className="author-note">{note}</span>}
-    </>
-  );
-  return onOpen ? (
-    <button type="button" className="author-line" onClick={onOpen}>
-      {content}
-    </button>
-  ) : (
-    <div className="author-line">{content}</div>
-  );
-}
-
 function EmptyChat({
   title,
   detail,
@@ -2879,5 +2901,39 @@ function EmptyChat({
         </div>
       )}
     </div>
+  );
+}
+
+/** A notice's 「拉进群」: the no-supervisor case, where the user confirms the pull-in. */
+function InviteNoticeButton({ conversationID, message }: { conversationID: string; message: Message }) {
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const invite = message.invite;
+  if (!invite) return null;
+  const pull = async () => {
+    if (sending) return;
+    setSending(true);
+    setError(null);
+    const failure = await store.inviteMember(
+      conversationID,
+      invite.agent_id,
+      invite.message_id,
+      message.id,
+    );
+    setSending(false);
+    if (failure) setError(failure);
+  };
+  return (
+    <>
+      <button
+        type="button"
+        className="link-button notice-invite"
+        disabled={sending}
+        onClick={() => void pull()}
+      >
+        {sending ? "拉进群中…" : "拉进群"}
+      </button>
+      {error && <span className="form-error">{error}</span>}
+    </>
   );
 }

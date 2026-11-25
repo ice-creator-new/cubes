@@ -5,7 +5,7 @@
 // Images, PDFs and text files come in by paste, drop or the + button; they upload at once and
 // wait above the text (images as thumbnails, files as chips) until the message goes.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { Agent, Run, SendMode } from "../api/types";
 import { errorMessage } from "../api/client";
 import {
@@ -20,7 +20,7 @@ import {
   type Kind,
 } from "../lib/attachments";
 import { composingKey } from "../lib/ime";
-import { insertMention, mentionedIDs, mentionQuery } from "../lib/mentions";
+import { insertMention, mentionCandidates, mentionedIDs, mentionQuery } from "../lib/mentions";
 import { insertSlash, slashQuery } from "../lib/skills";
 import { useAnimatedHeight, usePresence } from "../lib/motion";
 import { isCliBot } from "../lib/modelOptions";
@@ -55,6 +55,7 @@ const EVERYONE_ID = "__everyone__";
 export function Composer({
   conversationID,
   roster,
+  outside = [],
   run,
   placeholder,
   autoFocus,
@@ -63,6 +64,8 @@ export function Composer({
 }: {
   conversationID: string;
   roster: Agent[];
+  /** Team agents not in this group: offered under 「不在群里」, and pulled in when @-ed. */
+  outside?: Agent[];
   run: Run | undefined;
   placeholder: string;
   autoFocus?: boolean;
@@ -104,14 +107,20 @@ export function Composer({
   const candidates = useMemo(() => {
     if (!query) return [];
     const needle = query.text.toLowerCase();
-    const matches = roster.filter((agent) => agent.name.toLowerCase().includes(needle)).slice(0, 6);
+    const found = mentionCandidates(roster, outside, needle, 6);
     // A group (more than the supervisor and one member) can be addressed as a whole.
     const members = roster.filter((agent) => agent.kind === "member").length;
     if (members > 1 && EVERYONE.includes(needle)) {
-      return [{ ...roster[0], id: EVERYONE_ID, name: EVERYONE, instructions: "每位成员各自独立回答" } as Agent, ...matches];
+      return [
+        {
+          agent: { ...roster[0], id: EVERYONE_ID, name: EVERYONE, instructions: "每位成员各自独立回答" } as Agent,
+          outside: false,
+        },
+        ...found,
+      ];
     }
-    return matches;
-  }, [query, roster]);
+    return found;
+  }, [query, roster, outside]);
   // `/名称` calls a skill; only enabled ones are offered, best match (name prefix) first.
   const slash = query ? null : slashQuery(draft, caret);
   const skillCandidates = useMemo(() => {
@@ -122,7 +131,7 @@ export function Composer({
       .sort((a, b) => Number(!a.name.startsWith(needle)) - Number(!b.name.startsWith(needle)))
       .slice(0, 6);
   }, [slash, state.skills]);
-  const mentionOpen = roster.length > 0 && query !== null && candidates.length > 0 && !pickerDismissed;
+  const mentionOpen = query !== null && candidates.length > 0 && !pickerDismissed;
   const skillOpen = slash !== null && skillCandidates.length > 0 && !pickerDismissed;
   const pickerOpen = mentionOpen || skillOpen;
   const pickerCount = mentionOpen ? candidates.length : skillCandidates.length;
@@ -312,35 +321,47 @@ export function Composer({
     <div className="composer-wrap">
       {mentionOpen && (
         <div className="mention-picker" role="listbox" aria-label="点名成员">
-          {candidates.map((agent, index) => (
-            <button
-              key={agent.id}
-              type="button"
-              role="option"
-              aria-selected={index === highlight}
-              className={index === highlight ? "mention-option active" : "mention-option"}
-              onMouseEnter={() => setHighlight(index)}
-              onMouseDown={(event) => {
-                event.preventDefault();
-                pick(agent.name);
-              }}
-            >
-              {agent.id === EVERYONE_ID ? (
-                <Icon name="team" size={20} />
-              ) : (
-                <Avatar
-                  seed={agent.avatar_seed}
-                  appearance={agent.appearance}
-                  size={24}
-                  name={agent.name}
-                  mood={moodFor(state, agent.id, conversationID)}
-                />
+          {candidates.map(({ agent, outside: isOutside }, index) => (
+            <Fragment key={agent.id}>
+              {isOutside && !candidates[index - 1]?.outside && (
+                <div className="mention-divider" role="presentation">
+                  不在群里
+                </div>
               )}
-              <span className="mention-name">{agent.name}</span>
-              <span className="mention-role">
-                {agent.id === EVERYONE_ID ? agent.instructions : agent.kind === "supervisor" ? "负责人" : agent.instructions.split("\n")[0]}
-              </span>
-            </button>
+              <button
+                type="button"
+                role="option"
+                aria-selected={index === highlight}
+                className={index === highlight ? "mention-option active" : "mention-option"}
+                onMouseEnter={() => setHighlight(index)}
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  pick(agent.name);
+                }}
+              >
+                {agent.id === EVERYONE_ID ? (
+                  <Icon name="team" size={20} />
+                ) : (
+                  <Avatar
+                    seed={agent.avatar_seed}
+                    appearance={agent.appearance}
+                    size={24}
+                    name={agent.name}
+                    mood={moodFor(state, agent.id, conversationID)}
+                  />
+                )}
+                <span className="mention-name">{agent.name}</span>
+                <span className="mention-role">
+                  {agent.id === EVERYONE_ID
+                    ? agent.instructions
+                    : isOutside
+                      ? "不在群里"
+                      : agent.kind === "supervisor"
+                        ? "负责人"
+                        : agent.instructions.split("\n")[0]}
+                </span>
+              </button>
+            </Fragment>
           ))}
         </div>
       )}
@@ -580,7 +601,7 @@ export function Composer({
                   event.preventDefault();
                   if (mentionOpen) {
                     const chosen = candidates[highlight];
-                    if (chosen) pick(chosen.name);
+                    if (chosen) pick(chosen.agent.name);
                   } else {
                     const chosen = skillCandidates[highlight];
                     if (chosen) pickSkill(chosen.name);

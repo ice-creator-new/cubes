@@ -301,6 +301,16 @@ class _BaseStream:
 class OpenAIChatStream(_BaseStream):
     """One streamed Chat Completions reply against ``resolved.base_url``."""
 
+    def __init__(
+        self,
+        client: httpx.AsyncClient | None,
+        resolved: ResolvedModel,
+        **options: Any,
+    ) -> None:
+        # Only this protocol has a reasoning-effort field; the base class ignores the rest.
+        self._reasoning_effort = options.pop("reasoning_effort", None)
+        super().__init__(client, resolved, **options)
+
     def _request(self) -> httpx.Request:
         assert self._client is not None  # guarded by chunks()
         payload: dict[str, Any] = {
@@ -311,6 +321,9 @@ class OpenAIChatStream(_BaseStream):
             # nothing to check itself against.
             "stream_options": {"include_usage": True},
         }
+        if self._reasoning_effort:
+            # A cheap routing call asks for the least thinking the model names.
+            payload["reasoning_effort"] = self._reasoning_effort
         if self._max_tokens is not None:
             payload["max_tokens"] = self._max_tokens
         if self._tools:
@@ -431,6 +444,7 @@ def open_stream(
     session: Any = None,
     prompt_messages: list[dict[str, Any]] | None = None,
     cli_tools: Any = None,
+    reasoning_effort: str | None = None,
 ) -> ModelStream:
     """One stream for ``resolved.protocol``; the engine never knows which adapter ran.
 
@@ -470,6 +484,7 @@ def open_stream(
         tools=tools,
         purpose=purpose,
         max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
     )
 
 

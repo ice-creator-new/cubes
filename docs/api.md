@@ -26,6 +26,8 @@
 | `DELETE /runs/{id}` | 撤回一条还在排队的发送：删掉那条消息和它的运行，推送 `message_removed`；已经开始或已结束的运行返回 409，不存在返回 404 |
 | `POST /conversations/{id}/messages/{mid}/edit` | 改一条自己发的消息 `{content}`：删掉这一条和它后面的全部内容（连带工具行、图片绑定、摘要、只存在于后半段的运行），按新文本重新开始一次任务并把这条消息原来的图片带过去；不是自己的消息或行动行 422，会话正在运行 409，私聊 403，没有这条消息 404。返回新任务 |
 | `POST /conversations/{id}/messages/{mid}/rewind` | 删掉这条消息之后的全部内容，这条保留；会话正在运行 409。返回这个会话剩下的全部消息（`has_more` 为 false），其他窗口收到 `message_removed` 与 `workspace` |
+| `POST /conversations/{id}/messages/{mid}/reroute` | 重新派发一条自己发的群消息 `{speakers: [成员 id]}`：正在回答它的运行先停下，再用这几位重新回答，不新写用户消息；这条消息的 `route` 改成 `by: "user"`，`intents` 清掉。不是群组 400、不是自己的消息 422、有人不在群里 422、这条还在排队 409、会话正忙 409。返回新运行 |
+| `POST /conversations/{id}/invite` | 确认一条通知上的「拉进群」`{agent_id, message_id?, notice_id?}`：把成员加进群并发一行「已把 X 拉进群」，清掉那条通知的 `invite`；带 `message_id` 时启动一次运行，让这位成员回答那条被 @ 的消息（`route_override` 只有它）。不是群组或成员不存在 404、群正在回复 409。返回这次运行 |
 | `GET /webhooks?target_kind=&target_id=` | 一个定时任务或工作流名下的 Webhook（`{webhook: {id, target_kind, target_id, path, created_at, last_called_at}}`，没有时是 `null`）；永远不带密钥 |
 | `POST /webhooks` | 给一个目标创建 Webhook `{target_kind: "schedule"\|"workflow", target_id}`；返回里带唯一的 `secret`（只此一次）；目标不存在 404，已经有 Webhook 409 |
 | `POST /webhooks/{id}/rotate` | 换一个密钥（网址不变，旧密钥立刻失效），返回同样的带 `secret` 的形状；不存在 404 |
@@ -52,6 +54,8 @@
 | `POST /agents` | 新增成员；重名返回 409 |
 | `PATCH /agents/{id}` | 修改成员名称、职责、外观和模型；`appearance` 含 `shape`、`color` 和可选的 `eye`：`color` 是目录里的颜色或任意 `#rrggbb`，`eye` 是任意 `#rrggbb`，不传或传 null 时自动挑一个和身体对比清楚的眼睛颜色；`appearance` 传 null 时恢复默认外观；旧的 `expression` 字段会被接收、校验后丢弃；`model_ref` 为 `{provider_id, model}` 或 null（跟随默认），指向不存在的服务或不在列表里的模型时返回 422；CLI 协议还可带 `effort`（思考强度，必须是该模型支持的档位，否则 422），成员返回值带 `model_status`（`default`/`custom`/`fallback`）；`send_mode` 是这位成员忙时你发的消息怎么处理（`steer` / `queue` / `interrupt`，null 跟随团队的 `send_mode`）；重名返回 409 |
 | `POST /agents/{id}/direct` | 幂等返回该成员的私聊会话 |
+| `GET /agents/{id}/activities` | 这位成员的工作记录：每次发言（一轮活动）的最新在前，可按 `started_at` 用 `before` 往前翻（`limit` 默认 50），返回 `{activities, has_more}`；每条带标题、结论、状态、当前步骤、步数、起止时间和最终的答复消息 id |
+| `GET /activities/{id}` | 一条活动的详情：`activity`（同上）、`conversation_title`、`answer`（最终答复消息，可能为 null）和 `sections`——先是这一轮自己，再是它问过的同事或开出的任务线程；每个分组带 `messages`（这一轮写下的全部消息，格式与会话接口相同、从旧到新，含工具详情和附件）和 `steps`（每步带 `kind`（`tool`/`note`/`ask`/`handoff`）、`title`、`subtitle`、`status`、`message_id`、`action_id` 和指向分组的 `target_activity_id`）；不存在返回 404「这条记录不存在。」。运行中靠 `activity` 事件更新（每秒最多一次，状态一变立刻推） |
 | `DELETE /agents/{id}` | 删除成员及其私聊；主管（409）、正在回复的成员（409）、不存在的成员（404）会被拒绝。删除后推送 `workspace` 与 `sidebar` 事件 |
 | `POST /actions/{id}/confirm` | 回答等待中的行动（如删除成员）：`approve` 为 true 表示同意；再加 `always: true` 表示这次同意并记住一条规则，以后这位成员的同种操作不再出卡。返回处理后的行动；已处理过返回 409 |
 | `GET /approval-rules` | 已记住的「总是允许」规则：工具名、中文名 `title`、成员和创建时间 |

@@ -33,6 +33,12 @@ describe("route hint text", () => {
     expect(routeHint(route({ kind: "status" }), nameOf).text).toBe("→ 进度");
     expect(routeHint(route({ kind: "none" }), nameOf).text).toBe("→ 不需要回复");
   });
+
+  it("says routing is still running instead of naming anyone", () => {
+    const hint = routeHint(route({ pending: true, speakers: ["a1"] }), nameOf, taskTitle);
+    expect(hint.text).toBe("正在决定谁来接");
+    expect(hint.title).toBe("正在判断这条消息该交给谁");
+  });
 });
 
 describe("route hint tooltip", () => {
@@ -52,5 +58,33 @@ describe("route hint tooltip", () => {
   it("keeps a bare prefix when there is no reason", () => {
     expect(routeTitle(route({ by: "dispatcher", reason: "" }))).toBe("自动判断");
     expect(routeTitle(route({ by: "mention", reason: "  " }))).toBe("你点了名");
+  });
+});
+
+describe("route hint with several intents", () => {
+  it("writes one line per ask, in order, and an invite line", () => {
+    const hint = routeHint(
+      route({
+        speakers: ["a1", "a2"],
+        intents: [
+          { text: "不要用 flutter 了，改 react", kind: "answer", speakers: ["a1"], invite: [] },
+          { text: "让画师辅助匠师", kind: "invite", speakers: ["a2"], invite: ["a2"] },
+        ],
+      }),
+      nameOf,
+      taskTitle,
+    );
+    expect(hint.lines).toEqual([
+      "“不要用 flutter 了，改 react” → 匠师",
+      "邀请 乙 → 乙",
+    ]);
+    expect(hint.text).toBe("“不要用 flutter 了，改 react” → 匠师 · 邀请 乙 → 乙");
+  });
+
+  it("keeps the single-line look when there is only one intent", () => {
+    expect(
+      routeHint(route({ speakers: ["a1"], intents: [{ text: "改 react", kind: "answer", speakers: ["a1"], invite: [] }] }), nameOf)
+        .lines,
+    ).toBeUndefined();
   });
 });

@@ -26,6 +26,8 @@ import { WorkflowsPanel } from "./components/Workflows";
 import { SkillsPanel } from "./components/Skills";
 import { UsagePanel } from "./components/Usage";
 import { RunTraceSheet } from "./components/RunTrace";
+import { ActivitySheet } from "./components/ActivitySheet";
+import { WorkLog } from "./components/WorkLog";
 import { PaneHost } from "./components/Dialog";
 import { ACCENT_TOKENS, accentStyle, parseAccent, type Accent } from "./lib/accent";
 import { applyGlass, GLASS_KEY, parseGlass, type Glass } from "./lib/glass";
@@ -394,6 +396,7 @@ export function App() {
         onDissolveGroup={(id) => openTab({ kind: "group", id, confirmDissolve: true })}
         onNewGroup={() => setCreatingGroup(true)}
         onNewMember={() => setOverlay({ kind: "create" })}
+        onOpenWorkLog={(id) => openTab({ kind: "activities", id })}
       />
       {creatingGroup && (
         <NewGroupDialog
@@ -449,6 +452,8 @@ export function App() {
               onClosePrivate={closePrivate}
               onOpenRun={(run) => openTab(tabsModel.runTab(run))}
               onOpenWorkflows={() => openTool("workflows")}
+              onOpenActivity={(id) => openTab({ kind: "activity", id })}
+              onOpenWorkLog={(id) => openTab({ kind: "activities", id })}
             />
           </div>
         )}
@@ -539,6 +544,23 @@ export function App() {
                     onClose={close}
                     onOpenConversation={openFromTab}
                     onLoaded={(run) => update((state) => tabsModel.describeRun(state, run))}
+                  />
+                )}
+                {tab.kind === "activity" && (
+                  <ActivitySheet
+                    activityID={tab.id}
+                    active={shownTab}
+                    onClose={close}
+                    onOpenConversation={openFromTab}
+                    onLoaded={(activity) => update((state) => tabsModel.describeActivity(state, activity.id, activity.title))}
+                  />
+                )}
+                {tab.kind === "activities" && (
+                  <WorkLog
+                    agentID={tab.id}
+                    active={shownTab}
+                    onClose={close}
+                    onOpenActivity={(id) => openTab({ kind: "activity", id })}
                   />
                 )}
               </PaneHost>

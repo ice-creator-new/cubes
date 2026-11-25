@@ -90,3 +90,17 @@ export function mentionedIDs(draft: string, roster: { id: string; name: string }
   const names = new Set(mentionTokens(draft).map((token) => token.name));
   return roster.filter((agent) => names.has(agent.name)).map((agent) => agent.id);
 }
+
+/** `@` picker candidates: this group's members first, then team agents outside it. */
+export function mentionCandidates<T extends { name: string }>(
+  roster: T[],
+  outside: T[],
+  needle: string,
+  limit = 4,
+): { agent: T; outside: boolean }[] {
+  const match = (agent: T) => agent.name.toLowerCase().includes(needle);
+  return [
+    ...roster.filter(match).slice(0, limit).map((agent) => ({ agent, outside: false })),
+    ...outside.filter(match).slice(0, limit).map((agent) => ({ agent, outside: true })),
+  ];
+}

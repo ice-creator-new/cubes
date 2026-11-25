@@ -4112,6 +4112,14 @@ button.author-line:hover .author-name {
   animation: pop-in var(--t-fast) var(--ease);
 }
 
+.mention-divider {
+  margin: 6px 10px 2px;
+  padding-top: 6px;
+  border-top: 1px solid var(--hairline);
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
 .mention-option {
   width: 100%;
   display: flex;
@@ -4343,10 +4351,20 @@ button.author-line:hover .author-name {
 }
 
 .group-avatar-more {
-  border-radius: 50%;
-  background: var(--tint-strong);
-  font-size: 10px;
+  position: absolute;
+  right: -4px;
+  bottom: -3px;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  /* Opaque: the tint alone is see-through, so the face under it bled into the number. */
+  background: color-mix(in srgb, var(--ink) 12%, var(--canvas));
+  color: var(--ink);
   font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  letter-spacing: -0.02em;
 }
 
 .spinner {
@@ -15199,6 +15217,44 @@ button.task-card-title:hover {
   background: var(--tint);
   color: var(--ink-2);
 }
+.route-hint-stack {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  max-width: 100%;
+}
+.route-hint.multi {
+  white-space: normal;
+  text-align: right;
+}
+.route-hint-lines {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+}
+.route-hint-line {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.route-hint-more {
+  flex: none;
+  padding: 1px 4px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink-3);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.route-hint-more:hover {
+  background: var(--tint);
+  color: var(--ink-2);
+}
 .route-hint.none {
   color: color-mix(in srgb, var(--ink-3) 75%, transparent);
 }
@@ -15470,4 +15526,628 @@ button.task-card-title:hover {
 .work-row .form-error {
   flex: 1 0 100%;
   margin: 2px 8px 4px;
+}
+
+/* ---- one bot's work in a group: the card while it runs, the chip above its answer ----------
+   A group no longer narrates every step: the bot's rows fold into one card that says what it
+   is doing, and every detail lives one click away. The card borrows the task card's tint and
+   corner; the chip is plain text until hovered, so it never competes with the answer. */
+.dialog.pane.pane.work-log-dialog,
+.dialog.pane.pane.activity-dialog {
+  --pane-w: 700px;
+}
+/* The tab already says 「X · 工作记录」; the page's own head carries the status and time. */
+.dialog.pane.pane.activity-dialog > .dialog-head {
+  display: none;
+}
+.dialog.pane.pane.activity-dialog > .dialog-body {
+  padding-top: 18px;
+}
+.dialog.pane.pane.work-log-dialog > .dialog-head h2 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.activity-turn > .author-line {
+  align-self: flex-start;
+}
+
+/* The card hugs its words, so the time sits next to the title instead of across the column. */
+.activity-card {
+  /* One sweep's width; the line and the border loop over it, so both move in step. */
+  --shimmer-tile: 320px;
+  position: relative;
+  overflow: hidden;
+  align-self: flex-start;
+  width: fit-content;
+  min-width: 240px;
+  max-width: var(--reply-max, min(88%, 760px));
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 14px 9px 12px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: var(--tint);
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease);
+}
+.activity-card:hover {
+  background: var(--tint-strong);
+}
+.activity-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.activity-card.waiting {
+  background: color-mix(in srgb, var(--warn) 8%, var(--tint));
+}
+/* The kind of work as a bare glyph on the title's line: no tile behind it. */
+.activity-card-icon {
+  flex: none;
+  display: inline-flex;
+  margin-top: 2px;
+  color: var(--ink-3);
+}
+.activity-card.working .activity-card-icon {
+  color: var(--accent);
+}
+/* While it works a band of light runs along the border. The ring is a masked layer, so the
+   card stays transparent over the glass window instead of painting a fill to hide it. */
+.activity-card.working::after {
+  content: "";
+  position: absolute;
+  /* Inside the padding box: the card's overflow clip would cut a ring drawn on its border. */
+  inset: 0;
+  padding: 1px;
+  border-radius: inherit;
+  pointer-events: none;
+  background-image: linear-gradient(
+    90deg,
+    transparent 0,
+    transparent 32%,
+    color-mix(in srgb, var(--accent) 70%, transparent) 50%,
+    transparent 68%,
+    transparent 100%
+  );
+  background-size: var(--shimmer-tile) 100%;
+  background-repeat: repeat-x;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+  animation: activity-shimmer 2.4s linear infinite;
+}
+.activity-card-body {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+.activity-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.activity-card-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: 500;
+  line-height: 1.45;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.activity-card-meta {
+  flex: none;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+}
+.activity-card-step {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--ink-3);
+}
+.activity-card-line {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  animation: activity-line-in 220ms var(--ease);
+}
+@keyframes activity-line-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+}
+/* The live line breathes a soft light sweep: ink by default, the accent at the crest. */
+/* The sweep is one repeating tile of fixed width that slides by exactly one tile per loop, so
+   the last frame is the first: no jump back, no half band at the start. Pixel units keep the
+   speed the same on a short line and a long one. */
+.activity-card-line.shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--ink-3) 0,
+    var(--ink-3) 30%,
+    var(--ink) 42%,
+    var(--accent) 50%,
+    var(--ink) 58%,
+    var(--ink-3) 70%,
+    var(--ink-3) 100%
+  );
+  background-size: var(--shimmer-tile) 100%;
+  background-repeat: repeat-x;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: activity-line-in 220ms var(--ease), activity-shimmer 2.4s linear infinite;
+}
+@keyframes activity-shimmer {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: var(--shimmer-tile) 0;
+  }
+}
+.activity-card-chevron {
+  flex: none;
+  display: inline-flex;
+  color: var(--ink-3);
+  opacity: 0;
+  transition: opacity var(--t-fast) var(--ease);
+}
+.activity-card:hover .activity-card-chevron,
+.activity-card:focus-visible .activity-card-chevron {
+  opacity: 1;
+}
+
+/* The finished run as one quiet line above its answer: text first, a wash only on hover. */
+.activity-chip {
+  align-self: flex-start;
+  max-width: var(--reply-max, min(88%, 760px));
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: -2px 0 0;
+  padding: 1px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-3);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+.activity-chip:hover {
+  background: var(--rail-hover);
+  color: var(--ink-2);
+}
+.activity-chip:hover .activity-chip-text {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--ink-3);
+}
+.activity-chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.activity-chip > svg {
+  flex: none;
+}
+.activity-chip.done > svg:first-child {
+  color: var(--ok);
+}
+.activity-chip.stopped > svg:first-child,
+.activity-chip.waiting > svg:first-child {
+  color: var(--warn);
+}
+.activity-chip.error > svg:first-child {
+  color: var(--danger);
+}
+.activity-chip-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.activity-chip-turn {
+  margin-top: 0;
+}
+
+/* ---- the detail sheet ----------------------------------------------------------------------
+   One reading column: a status line, the title, what it concluded, then the answer and the
+   timeline. Sections are named in the mono face, and the steps hang off a dotted rail. */
+.activity-sheet {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding-bottom: 4px;
+}
+.activity-sheet-eyebrow {
+  margin: 0 0 8px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.activity-sheet-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  margin-bottom: 8px;
+}
+.activity-sheet-head .run-status-pill {
+  padding: 1px 9px;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.activity-sheet-head .activity-sheet-meta {
+  margin: 0;
+}
+.activity-sheet-title {
+  margin: 0 0 5px;
+  font-size: 22px;
+  font-weight: 650;
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+  color: var(--ink);
+}
+.activity-sheet-summary {
+  margin: 0 0 12px;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  white-space: pre-wrap;
+}
+.activity-sheet-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 3px 0;
+  margin: 0 0 16px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+}
+.activity-sheet-meta > span + span::before,
+.activity-sheet-meta > span + button::before {
+  content: "·";
+  margin: 0 7px;
+  color: var(--ink-3);
+}
+.activity-sheet-meta .link-button {
+  padding: 0;
+  border-radius: 4px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--ink-2);
+}
+.activity-sheet-meta .link-button:hover {
+  background: none;
+  color: var(--ink);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.activity-sheet-answer {
+  margin: 0;
+  padding: 0;
+  font-size: 14.5px;
+  line-height: 1.75;
+  color: var(--ink-2);
+}
+.activity-sheet-answer .markdown > :first-child {
+  margin-top: 0;
+}
+.activity-sheet-answer .markdown > :last-child {
+  margin-bottom: 0;
+}
+.activity-sheet-waiting {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 14px;
+  font-size: 12.5px;
+  color: var(--ink-3);
+}
+.activity-divider {
+  margin: 0 0 14px;
+  border: 0;
+  border-top: 1px solid var(--hairline);
+}
+.activity-sections {
+  display: grid;
+  gap: 26px;
+}
+.activity-section {
+  display: grid;
+  gap: 4px;
+  border-radius: 10px;
+  transition: background var(--t-slow) var(--ease);
+}
+.activity-section + .activity-section {
+  margin-top: 4px;
+  padding-top: 22px;
+  border-top: 1px solid var(--hairline);
+}
+.activity-section.flash {
+  background: var(--accent-wash);
+}
+.activity-section-label {
+  margin: 0 0 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+/* The section's body is the chat's own timeline: the same rows and the same folds. It is a
+   record on the sheet's own scroll, so it never takes a scroll of its own. */
+.activity-timeline.chat-scroll {
+  flex: none;
+  overflow: visible;
+  mask-image: none;
+  -webkit-mask-image: none;
+}
+.activity-timeline .column {
+  --reply-max: min(100%, 620px);
+  max-width: none;
+  padding: 2px 0 6px 4px;
+  gap: 8px;
+}
+.activity-timeline .column > .turn.user,
+.activity-timeline .column > .turn.agent:not(.continues) {
+  margin-top: 6px;
+}
+/* The live card's spinner is also the work log's: one spinning dot for both. */
+.activity-step-spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--accent-wash);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: activity-spin 0.9s linear infinite;
+}
+@keyframes activity-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+
+/* ---- the work log --------------------------------------------------------------------------
+   A plain feed, not a settings table: a 40px tinted glyph for the kind of work, a bold title,
+   two lines of summary and the time underneath. Day headers stand well clear of their group. */
+.work-log {
+  width: 100%;
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 2px 0 12px;
+  display: grid;
+  gap: 14px;
+}
+.work-log-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.work-log-head-text {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.work-log-name {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.work-log-count {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+.work-log-days {
+  display: grid;
+  gap: 30px;
+}
+.work-log-day {
+  display: grid;
+  gap: 4px;
+}
+.work-log-day-label {
+  margin: 0 0 4px;
+  padding: 0 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--ink-2);
+}
+.work-log-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+}
+.work-log-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  align-items: start;
+  gap: 14px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease);
+}
+.work-log-row:hover {
+  background: var(--rail-hover);
+}
+.work-log-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.work-log-row-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--tint);
+  background: color-mix(in srgb, currentColor 16%, var(--tint));
+  color: var(--ink-2);
+}
+.work-log-row.kind-search .work-log-row-icon,
+.work-log-row.kind-browser .work-log-row-icon {
+  color: var(--accent);
+}
+.work-log-row.kind-file .work-log-row-icon {
+  color: var(--warn);
+}
+.work-log-row.kind-terminal .work-log-row-icon {
+  color: var(--ok);
+}
+.work-log-row.kind-chat .work-log-row-icon,
+.work-log-row.kind-work .work-log-row-icon {
+  color: var(--ink-2);
+}
+.work-log-row.stopped .work-log-row-icon,
+.work-log-row.waiting .work-log-row-icon {
+  color: var(--warn);
+}
+.work-log-row.error .work-log-row-icon {
+  color: var(--danger);
+}
+.work-log-row-icon .activity-step-spinner {
+  width: 14px;
+  height: 14px;
+  border-width: 2px;
+}
+.work-log-row-text {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  padding-top: 1px;
+}
+.work-log-row-title {
+  font-size: 14.5px;
+  font-weight: 600;
+  line-height: 1.42;
+  letter-spacing: -0.005em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.work-log-row-line {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--ink-3);
+}
+.work-log-row-time {
+  margin-top: 2px;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+}
+
+/* The dispatcher's recent failures, quiet enough to read beside the model pick. */
+.dispatch-health {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--warn);
+}
+
+/* Routing still running: three dots rather than names, and nothing to click yet. */
+.route-hint.pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  cursor: default;
+  color: var(--ink-3);
+}
+.route-hint.pending:hover {
+  background: transparent;
+}
+.pending-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 3px;
+}
+.pending-dots i {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pending-dot 1.2s var(--ease) infinite;
+}
+.pending-dots i:nth-child(2) {
+  animation-delay: 0.16s;
+}
+.pending-dots i:nth-child(3) {
+  animation-delay: 0.32s;
+}
+@keyframes pending-dot {
+  0%,
+  60%,
+  100% {
+    opacity: 0.25;
+  }
+  30% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .activity-card-pulse,
+  .pending-dots i,
+  .activity-step-spinner {
+    animation: none;
+  }
+  /* A still line, read in plain ink: no sweep, no fade in. */
+  .activity-card.working::after {
+    display: none;
+  }
+  .activity-card-line,
+  .activity-card-line.shimmer {
+    animation: none;
+    background-image: none;
+    -webkit-text-fill-color: currentColor;
+    color: var(--ink-3);
+  }
+}
+
+.notice-invite {
+  flex: none;
+  font-size: 12px;
 }

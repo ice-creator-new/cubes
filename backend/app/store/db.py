@@ -21,7 +21,7 @@ from ..providers import DEFAULT_ENV_PROTOCOL, DEFAULT_ENV_PROVIDER_NAME, models_
 
 _UNSET = object()
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 LEGACY_SCHEMA_VERSION = 2
 BACKUP_SUFFIX = ".pre-team-backup.sqlite3"
 
@@ -574,6 +574,34 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_working_files_recent ON working_files(conversation_id, updated_at DESC)",
+    # v33: one bot's piece of work in one conversation — a turn from its first word to its
+    # answer, stop or failure. The steps are its own messages (its tool calls and the
+    # narration leading into them), a group hides them behind the turn's card, and
+    # ``parent_id`` names the activity that caused this one (an ``ask_agent`` answer, a task
+    # thread, a bot-to-bot hand-off). ``task_id`` is set for a task-thread turn.
+    """
+    CREATE TABLE IF NOT EXISTS activities (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL,
+        agent_name TEXT NOT NULL,
+        run_id TEXT,
+        task_id TEXT,
+        parent_id TEXT,
+        title TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        current_step TEXT NOT NULL DEFAULT '',
+        latest_text TEXT NOT NULL DEFAULT '',
+        request_message_id TEXT,
+        answer_message_id TEXT,
+        started_at TEXT NOT NULL,
+        finished_at TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_activities_agent ON activities(agent_id, started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_activities_conversation ON activities(conversation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_activities_parent ON activities(parent_id, started_at)",
 )
 
 # Additive columns introduced after a table first shipped: a plain ``ALTER TABLE`` keeps
@@ -626,6 +654,10 @@ COLUMN_UPGRADES: dict[str, tuple[tuple[str, str], ...]] = {
         ("addresses", "TEXT NOT NULL DEFAULT '[]'"),
         # v32: a ``kind="status"`` row's structured progress card (JSON).
         ("status_card", "TEXT"),
+        # v33: the bot turn (an activity) that wrote this row; NULL on old and non-turn rows.
+        ("activity_id", "TEXT"),
+        # v34: a notice that offers to pull one agent into the group (JSON, see models.InviteOut).
+        ("invite", "TEXT"),
     ),
     "runs": (
         ("current_agent_id", "TEXT"),
@@ -896,6 +928,10 @@ class Database:
                 # v30 added ``group_tasks.thread_id`` above, so its index follows as well.
                 tx.execute(
                     "CREATE INDEX IF NOT EXISTS idx_group_tasks_thread ON group_tasks(thread_id)"
+                )
+                # v33: ``messages.activity_id`` is added above, so its index follows too.
+                tx.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_messages_activity ON messages(activity_id)"
                 )
                 # v14 runs it again: replies ending in a lone unclosed ``<focused>`` slipped past.
                 if version < 14:
@@ -1517,6 +1553,14 @@ class Database:
                 "UPDATE group_tasks SET status = 'stopped', stopped_by = ?, updated_at = ? "
                 "WHERE status IN ('running', 'awaiting', 'queued')",
                 ("重启后中断", timestamp),
+            )
+            # A turn the dead process was writing stopped with it: its card says so instead
+            # of promising work that nobody is doing any more.
+            tx.execute(
+                "UPDATE activities SET status = 'stopped', current_step = '', "
+                "summary = '已停下：服务重启导致任务中断', finished_at = ? "
+                "WHERE status IN ('running', 'awaiting')",
+                (timestamp,),
             )
             runs = tx.execute(
                 """

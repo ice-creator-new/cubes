@@ -578,7 +578,7 @@ export function Avatar({
   );
 }
 
-/** A group's face: member faces overlapping; past four, three faces and a `+N`. */
+/** A group's face: up to four member faces; past four, three faces and a `+N`. */
 export function GroupAvatar({
   members,
   size,
@@ -590,9 +590,10 @@ export function GroupAvatar({
   awake?: boolean;
   track?: Track;
 }) {
-  const overflow = members.length > 4 ? members.length - 3 : 0;
-  const shown = members.slice(0, overflow ? 3 : 4);
-  const count = shown.length + (overflow ? 1 : 0);
+  const compact = members.length > 4;
+  const shown = members.slice(0, compact ? 3 : 4);
+  const overflow = compact ? members.length - shown.length : 0;
+  const count = Math.max(1, shown.length);
   const moods = useTeam((state) => state.moods);
   const face = Math.round(size * 0.62);
   const spread = size * 0.2;
@@ -602,13 +603,18 @@ export function GroupAvatar({
     3: [[0, -0.85], [-1, 0.7], [1, 0.7]],
     4: [[0.95, -0.75], [-1, 0.15], [0.45, 0.95], [-0.2, -0.95]],
   };
-  const points = slots[Math.max(1, Math.min(4, count))] ?? [[0, 0]];
+  const points = slots[Math.min(4, count)] ?? [[0, 0]];
   const place = (index: number) => {
     const [x, y] = points[Math.min(index, points.length - 1)] ?? [0, 0];
     return { transform: `translate(${x * spread}px, ${y * spread}px)` };
   };
+  const badge = Math.max(13, Math.round(size * 0.42));
   return (
-    <span className="group-avatar" style={{ width: size, height: size }} aria-hidden="true">
+    <span
+      className="group-avatar"
+      style={{ width: size, height: size }}
+      title={`${members.length} 位成员`}
+    >
       {shown.map((member, index) => (
         <span key={member.id} className="group-avatar-slot" style={place(index)}>
           <Avatar
@@ -625,8 +631,12 @@ export function GroupAvatar({
       ))}
       {overflow > 0 && (
         <span
-          className="group-avatar-slot group-avatar-more"
-          style={{ ...place(3), width: face * 0.72, height: face * 0.72 }}
+          className="group-avatar-more"
+          style={{
+            width: badge,
+            height: badge,
+            fontSize: Math.max(8, Math.round(size * 0.27)),
+          }}
         >
           +{overflow}
         </span>

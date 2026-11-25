@@ -28,6 +28,7 @@ class Actions:
         avatar_seed: str,
         status: str = "running",
         confirmation: dict | None = None,
+        activity_id: str | None = None,
     ) -> tuple[dict, dict]:
         """Persist the pending action *and* its chat message before any side effect."""
         action_id = new_id("x")
@@ -70,6 +71,7 @@ class Actions:
                 action_id=action_id,
                 created_at=timestamp,
                 run_id=run_id,
+                activity_id=activity_id,
             )
             self._touch(tx, conversation_id)
         action = self.get_action(action_id)

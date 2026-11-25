@@ -115,6 +115,21 @@ def test_cancelling_one_run_leaves_the_other_running() -> None:
     host.close()
 
 
+def test_shell_without_a_cwd_starts_in_the_working_folder(tmp_path) -> None:
+    host = HostComputer(default_cwd=lambda: tmp_path)
+    explicit = tmp_path / "elsewhere"
+    explicit.mkdir()
+
+    def run(args: dict) -> dict:
+        return host.call("shell", {**args, "timeout": 10}, run_id="run-1")
+
+    default = run({"command": "pwd"})
+    assert default["cwd"] == str(tmp_path)
+    chosen = run({"command": "pwd", "cwd": str(explicit)})
+    assert chosen["cwd"] == str(explicit)
+    host.close()
+
+
 def test_host_permissions_can_be_read_without_prompting() -> None:
     from app.host_computer import host_permissions
 

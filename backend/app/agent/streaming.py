@@ -193,6 +193,7 @@ class Streaming:
                         note_tool_start()
                 if safe and message is not None:
                     self._note_task_text(active, safe)
+                    self._note_activity_text(active, safe)
                 if safe and not active.background and message is not None:
                     self._publish(
                         "delta",

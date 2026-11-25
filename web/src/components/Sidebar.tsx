@@ -79,6 +79,7 @@ export function Sidebar({
   onDissolveGroup,
   onNewGroup,
   onNewMember,
+  onOpenWorkLog,
 }: {
   collapsed: boolean;
   onToggle: () => void;
@@ -106,6 +107,8 @@ export function Sidebar({
   onNewGroup: () => void;
   /** Opens the dialog that creates a member bot. */
   onNewMember: () => void;
+  /** Opens a bot's whole work log from its row's menu. */
+  onOpenWorkLog: (agentID: string) => void;
 }) {
   const state = useTeam((s) => s);
   const workspace = state.workspace;
@@ -379,7 +382,10 @@ export function Sidebar({
       });
       items.push({ label: "移到分组", icon: "folder", submenu: targets });
     }
-    if (owner) items.push({ label: "编辑", icon: "rename", onSelect: () => onEditBot(owner.id) });
+    if (owner) {
+      items.push({ label: "工作记录", icon: "history", onSelect: () => onOpenWorkLog(owner.id) });
+      items.push({ label: "编辑", icon: "rename", onSelect: () => onEditBot(owner.id) });
+    }
     if (owner?.kind === "member") items.push({ label: "删除成员…", icon: "trash", danger: true, onSelect: () => onDeleteMember(owner.id) });
     if (conversation.kind === "group") {
       items.push({ label: "解散群组…", icon: "trash", danger: true, onSelect: () => onDissolveGroup(conversation.id) });

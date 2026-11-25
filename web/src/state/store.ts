@@ -4,6 +4,7 @@
 import { useSyncExternalStore } from "react";
 import { ApiClient, ApiError, errorMessage, loadBaseURL, normalizeBaseURL, saveBaseURL } from "../api/client";
 import type {
+  Activity,
   GroupTask,
   Action,
   Agent,
@@ -82,6 +83,7 @@ import {
   patchGroupThreadProgress,
 } from "../lib/taskProgress";
 import { isLive } from "../lib/workflow";
+import { isLiveActivity } from "../lib/activities";
 
 /** Where each task thread's group is remembered, so a restored thread tab still knows its way
  *  back before any group's tasks have been read. */
@@ -170,6 +172,8 @@ export interface TeamState {
   tasks: TaskItem[] | null;
   /** Each group's tasks, newest first, by conversation id; a group is read when it opens. */
   groupTasks: Record<string, GroupTask[]>;
+  /** One bot's pieces of work, by activity id: the live ones feed a group's cards and sheets. */
+  activities: Record<string, Activity>;
   /** Thread details opened inline from a card, kept live from the same message events. */
   threadDetails: Record<string, ConversationDetail>;
   /** Which group a task thread belongs to, once known: the thread's way back to its group. */
@@ -226,6 +230,8 @@ class TeamStore {
   private readMarks = new Map<string, number>();
   /** The shell is asked once per page load, before the first request goes out. */
   private adopted: Promise<boolean> | null = null;
+  /** Activities whose payload is being read after a reload named them before any event did. */
+  private activityLoads = new Set<string>();
 
   constructor() {
     const baseURL = loadBaseURL();
@@ -264,6 +270,8 @@ class TeamStore {
       notes: null,
       tasks: null,
       groupTasks: {},
+      /** Every activity the stream has told us about, by id; a group's chat draws its live ones. */
+      activities: {},
       threadDetails: {},
       threadGroups: readThreadGroups(),
       schedules: null,
@@ -1321,6 +1329,25 @@ class TeamStore {
   }
 
   /**
+   * One activity the chat named before its event arrived (a reload reads the rows first). The
+   * stream's own payload wins when it lands while this is in flight, so an older read is dropped.
+   */
+  async loadActivity(id: string): Promise<void> {
+    if (this.state.activities[id] || this.activityLoads.has(id)) return;
+    this.activityLoads.add(id);
+    try {
+      const { activity } = await this.api.activityDetail(id);
+      if (!this.state.activities[id]) {
+        this.set({ activities: { ...this.state.activities, [activity.id]: activity } });
+      }
+    } catch {
+      // A record that is gone stays a quiet card; the chat itself still works.
+    } finally {
+      this.activityLoads.delete(id);
+    }
+  }
+
+  /**
    * The thread's last page, read once when a card is opened inline or waits on an action. The
    * stream's message events keep it current afterwards; an already-read thread is not re-read.
    */
@@ -1395,6 +1422,25 @@ class TeamStore {
   async rerouteMessage(conversationID: string, messageID: string, speakers: string[]): Promise<string | null> {
     try {
       await this.api.rerouteMessage(conversationID, messageID, speakers);
+      if (this.state.selectedID === conversationID) await this.refreshDetail(conversationID);
+      return null;
+    } catch (error) {
+      return errorMessage(error);
+    }
+  }
+
+  /**
+   * Confirms a notice's 「拉进群」: adds the agent, then the invited bot answers the message
+   * that @-ed them. Refreshes this chat so the button and the new reply both show.
+   */
+  async inviteMember(
+    conversationID: string,
+    agentID: string,
+    messageID: string | null,
+    noticeID: string,
+  ): Promise<string | null> {
+    try {
+      await this.api.inviteMember(conversationID, agentID, messageID, noticeID);
       if (this.state.selectedID === conversationID) await this.refreshDetail(conversationID);
       return null;
     } catch (error) {
@@ -2114,6 +2160,12 @@ class TeamStore {
         // A reconnect missed whatever moved meanwhile. A fold still shown as running may
         // have finished while the stream was down, so its state is not carried over.
         this.set({ contextEvents: {} });
+        // The same for activities: one still marked live is re-read when a card names it, so a
+        // card never claims a bot is working after the stream went quiet.
+        const settledActivities = Object.fromEntries(
+          Object.entries(this.state.activities).filter(([, activity]) => !isLiveActivity(activity.status)),
+        );
+        this.set({ activities: settledActivities });
         this.applyWorkspace(snapshot.workspace);
         if (snapshot.sidebar) this.set({ sidebar: snapshot.sidebar });
         // A reconnect missed whatever moved meanwhile: the snapshot is the newest truth and
@@ -2186,6 +2238,20 @@ class TeamStore {
         // Not an arrival: no gesture, no unread mark, no mood.
         this.applyMessage(data as Message, false);
         break;
+      case "activity": {
+        const activity = data as Activity;
+        if (
+          activity === null ||
+          typeof activity !== "object" ||
+          typeof activity.id !== "string" ||
+          typeof activity.conversation_id !== "string" ||
+          typeof activity.status !== "string"
+        ) {
+          break;
+        }
+        this.set({ activities: { ...this.state.activities, [activity.id]: activity } });
+        break;
+      }
       case "delta":
         this.applyDelta(data as Delta);
         break;

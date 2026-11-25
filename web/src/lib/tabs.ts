@@ -14,7 +14,11 @@ export type Tab =
   /** `conversation` and `at` (the run's start) name the tab, and `schedule` when a scheduled
    *  task started it (its hidden workspace is in no list); tabs stored before these existed
    *  have none of them and fall back to a plain label. */
-  | { kind: "run"; id: string; conversation?: string; at?: string; schedule?: string };
+  | { kind: "run"; id: string; conversation?: string; at?: string; schedule?: string }
+  /** One bot's work detail and one bot's whole work log. A detail tab learns its title from the
+   *  payload; a restored one falls back to a plain label. */
+  | { kind: "activity"; id: string; title?: string }
+  | { kind: "activities"; id: string };
 
 /** What opening a run's trace needs: the run, the conversation it ran in, when it started, and
  *  the scheduled task behind it, if any. */
@@ -53,6 +57,17 @@ export function describeRun(state: TabsState, run: RunRef): TabsState {
   return { ...state, tabs };
 }
 
+/** Fill in an open activity tab's title once its payload has been read (a restored tab has none). */
+export function describeActivity(state: TabsState, id: string, title: string): TabsState {
+  const key = `activity:${id}`;
+  const index = state.tabs.findIndex((tab) => tabKey(tab) === key);
+  const current = state.tabs[index];
+  if (!current || current.kind !== "activity" || current.title === title) return state;
+  const tabs = [...state.tabs];
+  tabs[index] = { kind: "activity", id, title };
+  return { ...state, tabs };
+}
+
 export interface TabsState {
   /** Open tabs, left to right; the pinned ones always come first. */
   tabs: Tab[];
@@ -88,7 +103,13 @@ export function openTab(state: TabsState, tab: Tab): TabsState {
   const index = state.tabs.findIndex((item) => tabKey(item) === key);
   if (index >= 0) {
     const tabs = [...state.tabs];
-    tabs[index] = tab;
+    const current = tabs[index]!;
+    // Opening an activity again (a card, a chip, the work log) must not forget the title the
+    // sheet already learned: the new request only names the id.
+    tabs[index] =
+      tab.kind === "activity" && current.kind === "activity" && !tab.title && current.title
+        ? { kind: "activity", id: tab.id, title: current.title }
+        : tab;
     return { ...state, tabs, active: key };
   }
   const from = state.active === null ? -1 : state.tabs.findIndex((item) => tabKey(item) === state.active);
@@ -223,6 +244,8 @@ export function cycle(state: TabsState, direction: 1 | -1): TabsState {
 /** A tab without its one-off flags (a pending delete or dissolve confirmation). */
 function plain(tab: Tab): Tab {
   if (tab.kind === "run") return runTab({ id: tab.id, conversation: tab.conversation ?? "", at: tab.at ?? "", schedule: tab.schedule });
+  // The title is what the payload said; keeping it names a restored tab before any read.
+  if (tab.kind === "activity") return tab.title ? { kind: "activity", id: tab.id, title: tab.title } : { kind: "activity", id: tab.id };
   return "id" in tab ? ({ kind: tab.kind, id: tab.id } as Tab) : tab;
 }
 
@@ -244,7 +267,7 @@ const TOOLS: readonly string[] = [
   "skills",
   "workflows",
 ];
-const WITH_ID: readonly string[] = ["chat", "member", "group", "run"];
+const WITH_ID: readonly string[] = ["chat", "member", "group", "run", "activity", "activities"];
 
 /** The stored tabs, keeping only well-formed ones; `null` (never stored) is told apart from empty. */
 export function restore(raw: string | null): TabsState | null {
@@ -254,7 +277,7 @@ export function restore(raw: string | null): TabsState | null {
     const tabs: Tab[] = [];
     for (const item of Array.isArray(data.tabs) ? data.tabs : []) {
       if (!item || typeof item !== "object") continue;
-      const { kind, id, conversation, at, schedule } = item as Record<string, unknown>;
+      const { kind, id, conversation, at, schedule, title } = item as Record<string, unknown>;
       if (typeof kind !== "string") continue;
       if (TOOLS.includes(kind)) tabs.push({ kind: kind as SidebarTool });
       else if (kind === "run" && typeof id === "string" && id) {
@@ -265,6 +288,8 @@ export function restore(raw: string | null): TabsState | null {
           ...(typeof at === "string" && at ? { at } : {}),
           ...(typeof schedule === "string" && schedule ? { schedule } : {}),
         });
+      } else if (kind === "activity" && typeof id === "string" && id) {
+        tabs.push({ kind, id, ...(typeof title === "string" && title ? { title } : {}) });
       } else if (WITH_ID.includes(kind) && typeof id === "string" && id) tabs.push({ kind, id } as Tab);
     }
     const unique = tabs.filter((tab, i) => tabs.findIndex((other) => tabKey(other) === tabKey(tab)) === i);

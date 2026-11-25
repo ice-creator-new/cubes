@@ -57,6 +57,13 @@ class FakeUpstream:
         # back on; ``error`` takes the provider down for that one call.
         self.dispatch_mode = "ok"
         self._dispatch_requests: list[dict] = []
+        # An activity's one naming call (title, and the summary when the turn ended) is a
+        # tiny no-tool call of its own, recorded apart and answered from its own script so a
+        # run's own replies stay indexable. The default is two usable lines.
+        self.activity_script: list[Any] | None = None
+        self.activity_text = "核对数据\n把发布页的数据核对了一遍。"
+        self.activity_mode = "ok"
+        self._activity_requests: list[dict] = []
         # Token usage every streamed reply reports when the request asked for it; ``None``
         # keeps the upstream silent, like a gateway that never sends a usage chunk.
         self.usage: dict | None = None
@@ -116,6 +123,17 @@ class FakeUpstream:
             return len(self._reaction_requests)
 
     @property
+    def activity_requests(self) -> list[dict]:
+        """The activity naming calls, in order."""
+        with self._lock:
+            return list(self._activity_requests)
+
+    @property
+    def activity_request_count(self) -> int:
+        with self._lock:
+            return len(self._activity_requests)
+
+    @property
     def dispatch_requests(self) -> list[dict]:
         """The group dispatcher calls, in order."""
         with self._lock:
@@ -151,6 +169,7 @@ class FakeUpstream:
                 "tool_choice": body.get("tool_choice"),
                 "stream_options": body.get("stream_options"),
                 "max_tokens": body.get("max_tokens"),
+                "reasoning_effort": body.get("reasoning_effort"),
                 "authorization": request.headers.get("authorization"),
             }
             if self._housekeeping(request):
@@ -159,6 +178,8 @@ class FakeUpstream:
                 return self._reaction_answer(record, self._frames)
             if self._dispatch(request):
                 return self._dispatch_answer(record, self._frames)
+            if self._activity_title(request):
+                return self._activity_answer(record, self._frames)
             with self._lock:
                 self._requests.append(record)
                 index = len(self._requests)
@@ -238,6 +259,8 @@ class FakeUpstream:
                 return self._reaction_answer(record, self._anthropic_frames)
             if self._dispatch(request):
                 return self._dispatch_answer(record, self._anthropic_frames)
+            if self._activity_title(request):
+                return self._activity_answer(record, self._anthropic_frames)
             with self._lock:
                 self._anthropic_requests.append(record)
                 index = len(self._anthropic_requests)
@@ -431,6 +454,40 @@ class FakeUpstream:
             {"kind": "answer", "speakers": speakers, "reason": "默认分发给点名或最近发言的成员。"},
             ensure_ascii=False,
         )
+
+    @staticmethod
+    def _activity_title(request: Request) -> bool:
+        """An activity's naming call: the purpose header marks it, like the dispatcher's."""
+        return (request.headers.get("x-cubes-purpose") or "").strip() == "activity-title"
+
+    def _activity_answer(self, record: dict, frames) -> Any:
+        """Serve one naming call from ``activity_script`` (or ``activity_text``)."""
+        with self._lock:
+            self._activity_requests.append(record)
+            index = len(self._activity_requests)
+        if self.activity_mode == "error":
+            return JSONResponse(
+                status_code=500, content={"error": {"message": "naming exploded"}}
+            )
+        spec = self._activity_spec(index)
+
+        async def stream():
+            async for frame in frames(spec):
+                yield frame
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    def _activity_spec(self, index: int) -> dict:
+        script = self.activity_script
+        if script:
+            entry = script[min(index - 1, len(script) - 1)]
+            if callable(entry):
+                entry = entry(self.activity_requests, index)
+            if isinstance(entry, dict):
+                return entry
+        # A naming answer is two short lines; pacing set for visible replies must not make
+        # every turn wait on it.
+        return {"content": self.activity_text, "chunk_count": 1, "chunk_delay": 0}
 
     def _memory_answer(self, record: dict, frames) -> Any:
         """Serve one housekeeping call from ``memory_script`` (or ``memory_text``)."""

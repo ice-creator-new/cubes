@@ -16,6 +16,7 @@ from ..models import (
     ConversationPatchRequest,
     ConversationReadRequest,
     GroupCreateRequest,
+    InviteRequest,
     MessageEditRequest,
     RerouteRequest,
     RunStartRequest,
@@ -476,6 +477,70 @@ async def reroute_message(
             route_override=speakers,
         )
     except EngineBusy as exc:  # pragma: no cover - the slot was checked free above
+        store.discard_run(run["id"])
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    publish_workspace(store, engine)
+    return models.run_payload(store.get_run(run["id"]) or run)
+
+
+@router.post("/conversations/{conversation_id}/invite", status_code=202)
+async def invite_member(
+    conversation_id: str,
+    payload: InviteRequest,
+    store: Store = Depends(get_store),
+    engine: SupervisorEngine = Depends(get_engine),
+) -> dict:
+    """Confirm a notice's 「拉进群」: add the agent, then let it answer the message it was @-ed in.
+
+    The group's supervisor does this itself in a run; this route is the no-supervisor case,
+    where the engine left a notice instead of guessing on the user's behalf.
+    """
+    conversation = store.get_conversation(conversation_id)
+    if conversation is None or conversation["kind"] != "group":
+        raise HTTPException(status_code=404, detail="群组不存在。")
+    agent = store.get_agent(payload.agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="成员不存在。")
+    message = None
+    if payload.message_id:
+        message = store.get_message(payload.message_id)
+        if message is None or message["conversation_id"] != conversation_id:
+            raise HTTPException(status_code=404, detail="要回答的消息不存在。")
+    if agent["id"] not in conversation["member_ids"]:
+        if engine.is_running(conversation_id) or store.active_run(conversation_id) is not None:
+            raise HTTPException(status_code=409, detail="这个群组正在回复，等它结束再拉人。")
+        members = [*conversation["member_ids"], agent["id"]]
+        updated = store.update_conversation(conversation_id, member_ids=members)
+        if updated is None:  # pragma: no cover - existence checked above
+            raise HTTPException(status_code=404, detail="群组不存在。")
+        notice = store.append_message(
+            conversation_id=conversation_id,
+            author_id=None,
+            author_name="系统",
+            avatar_seed=None,
+            kind="notice",
+            content=f"已把 {agent['name']} 拉进群",
+            status="complete",
+        )
+        engine.publish("message_start", models.message_payload(notice))
+        engine.publish("message_end", models.message_payload(notice))
+        publish_workspace(store, engine)
+    if payload.notice_id:
+        cleared = store.set_message_invite(payload.notice_id, None)
+        if cleared is not None:
+            engine.publish("message_end", models.message_payload(cleared))
+    if message is None:
+        return {"conversation_id": conversation_id, "member_ids": store.get_conversation(conversation_id)["member_ids"]}
+    run = store.begin_bare_run(conversation_id, str(message.get("content") or "拉进群"))
+    store.update_run(run["id"], current_agent_id=agent["id"])
+    try:
+        engine.start(
+            run["id"],
+            conversation_id,
+            message_id=message["id"],
+            route_override=[agent["id"]],
+        )
+    except EngineBusy as exc:  # pragma: no cover - checked free above
         store.discard_run(run["id"])
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     publish_workspace(store, engine)

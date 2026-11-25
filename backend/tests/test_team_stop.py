@@ -131,6 +131,61 @@ def test_stop_during_a_member_consult_marks_the_action_as_errored(make_backend, 
     asyncio.run(body())
 
 
+def test_a_stopped_group_turn_leaves_one_line_and_continue_goes_back_to_it(
+    make_backend, upstream
+) -> None:
+    backend = make_backend()
+    store = store_of(backend)
+    designer = store.create_agent(name="甲", instructions="查资料", kind="member")
+    group = store.create_conversation(
+        kind="group", title="资料组", purpose="把资料查清", member_ids=[designer["id"]]
+    )
+    upstream.chunk_delay = 0.2
+    upstream.chunk_count = 40
+    upstream.script = [
+        tool_calls(call("c1", "calculate", {"expression": "1+1"})),
+        {"content": None, "slow": True},
+        {"content": "接着查完了，结论是 2。"},
+    ]
+
+    async def body() -> None:
+        async with client_for(backend) as client:
+            run = await start_run(client, group["id"], "@甲 查一下这个数")
+            # The tool row is done and the bot's answer is still streaming when it stops.
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                detail = await get_conversation(client, group["id"])
+                if action_messages(detail) and any(
+                    m["kind"] == "agent" and m["status"] == "streaming"
+                    for m in detail["messages"]
+                ):
+                    break
+                await asyncio.sleep(0.05)
+            stopped = await stop_run(client, run["id"])
+            assert stopped["status"] == "stopped", stopped
+
+            detail = await get_conversation(client, group["id"])
+            stop_line = agent_messages(detail)[-1]
+            assert stop_line["author_id"] == designer["id"]
+            assert stop_line["status"] == "complete"
+            assert stop_line["content"].startswith("已停下：")
+            # One line, not a second wall of tool rows; the tool row itself stays.
+            assert len(action_messages(detail)) == 1
+
+            # No dispatcher call for 「继续」: it returns to the interrupted bot.
+            before = upstream.dispatch_request_count
+            upstream.chunk_count = 2
+            continued = await run_goal(client, group["id"], "继续")
+            assert continued["status"] == "completed", continued
+            after = await get_conversation(client, group["id"])
+            assert agent_messages(after)[-1]["author_id"] == designer["id"]
+            assert agent_messages(after)[-1]["content"] == "接着查完了，结论是 2。"
+            assert upstream.dispatch_request_count == before
+            assert store.interrupted_agent(group["id"]) is None
+
+    asyncio.run(body())
+
+
 def test_completed_run_stop_is_a_no_op(make_backend, upstream) -> None:
     backend = make_backend()
     upstream.script = [{"content": "完成"}]

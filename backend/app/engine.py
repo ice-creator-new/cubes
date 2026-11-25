@@ -2,10 +2,10 @@
 
 Each conversation owns at most one run and different conversations run in parallel. A run
 is a queue of agents: the message that starts it decides who replies first, every completed
-reply may hand the turn to further agents with ``@名字`` (at most :data:`MAX_HOPS`
-hand-offs), and whatever the model produced before a stop, a budget stop or an upstream
-failure is kept and marked ``interrupted``/``error`` — never completed. Subscribers are
-engine-wide, so one SSE stream reports every run.
+reply may hand the turn to further agents with ``@名字`` (at most :data:`RELAY_HOPS`
+hand-offs, then one conclusion for the user), and whatever the model produced before a stop,
+a budget stop or an upstream failure is kept and marked ``interrupted``/``error`` — never
+completed. Subscribers are engine-wide, so one SSE stream reports every run.
 """
 
 from __future__ import annotations
@@ -34,10 +34,11 @@ from .agent import budget as budget_rules
 from .agent import dangling as dangling_rules
 from .agent import history
 from .agent import working_set
+from .agent.activity import Activities
 from .agent.context import ContextWindow
 from .agent.memory import MemoryExtraction
 from .agent.reactions import ReactionResponses
-from .agent.run_state import GROUP_TASK, ActiveRun, QueuedAgent, TurnBudget
+from .agent.run_state import ACTIVITY, GROUP_TASK, ActiveRun, QueuedAgent, TurnBudget
 from .store import group_tasks as task_rules
 from .engine_workflows import WorkflowWalking
 from .agent.streaming import Streaming
@@ -63,6 +64,7 @@ from .model_stream import ModelStream, ToolCallFragment, open_stream
 from .providers import (
     CLI_PROTOCOLS,
     ResolvedModel,
+    model_caps,
     resolve_dispatch,
     resolve_fallback,
     resolve_model,
@@ -94,8 +96,9 @@ from .tools.types import ToolOffer, ToolRunContext, error_result
 SCHEDULE_PROGRESS_SECONDS = 1.0
 # A task's live payload reaches the group's card at most this often (<= 4/s).
 TASK_PROGRESS_SECONDS = 0.25
-MAX_HOPS = 8
-HOP_LIMIT_ERROR = "@ 接力已达 8 轮上限，已停止继续转交。"
+# Bot-to-bot @ hand-offs with no user message in between: after this many, the last bot (or
+# the group's supervisor) closes with one conclusion for the user instead of relaying on.
+RELAY_HOPS = 2
 # A destructive tool waits for the user; it re-checks the stop flag this often.
 CONFIRM_POLL_SECONDS = 0.05
 # How long POST /actions/{id}/confirm waits for the run to apply the decision.
@@ -110,6 +113,8 @@ OPINION_CUE = "opinion"
 # Slots that pick up a group task where it stopped, or that a member handed on.
 RESUME_CUE = "resume"
 TRANSFER_CUE = "transfer"
+# The one turn after the relay limit: nobody may be @-ed, the user gets the conclusion.
+CONCLUDE_CUE = "conclude"
 # A message that is only one of these, in a direct chat, picks up where the last run stopped.
 CONTINUE_WORDS = frozenset(
     {"继续", "接着做", "继续做", "接着", "继续吧", "go on", "continue", "resume", "keep going"}
@@ -141,6 +146,7 @@ logger = logging.getLogger(__name__)
 
 
 class SupervisorEngine(
+    Activities,
     Streaming,
     ContextWindow,
     MemoryExtraction,
@@ -185,7 +191,11 @@ class SupervisorEngine(
         # tools queue a walk through it, and it starts the next one when a run ends.
         self.launcher: Any = None
         self.connectors = ConnectorManager(store, self._publish)
-        host = None if os.environ.get("CUBES_HOST_COMPUTER") == "0" else HostComputer()
+        host = (
+            None
+            if os.environ.get("CUBES_HOST_COMPUTER") == "0"
+            else HostComputer(default_cwd=lambda: permissions.working_folder(self._settings))
+        )
         # The target is read in ``startup``: building the engine (importing ``app.main``) must
         # never open the database, or a stray import would run a live database's restart
         # recovery and stop the runs another process is serving.
@@ -196,6 +206,12 @@ class SupervisorEngine(
         self._task_progress_at: dict[str, float] = {}
         # The flat prose a thread run has shown so far, for the card's latest line.
         self._task_text: dict[str, str] = {}
+        # A bot turn is one activity: its newest prose, when its card last reached clients,
+        # and the naming calls still running (one per turn, never repeated).
+        self._activity_text: dict[str, str] = {}
+        self._activity_published_at: dict[str, float] = {}
+        self._activity_title_tasks: dict[str, asyncio.Task[None]] = {}
+        self._activity_titled: set[str] = set()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -253,6 +269,11 @@ class SupervisorEngine(
         if self._pump_tasks:
             await asyncio.gather(*self._pump_tasks, return_exceptions=True)
         self._pump_tasks.clear()
+        for task in list(self._activity_title_tasks.values()):
+            task.cancel()
+        if self._activity_title_tasks:
+            await asyncio.gather(*self._activity_title_tasks.values(), return_exceptions=True)
+        self._activity_title_tasks.clear()
         for task in list(self._compact_tasks):
             task.cancel()
         if self._compact_tasks:
@@ -336,7 +357,7 @@ class SupervisorEngine(
         ``schedule_id`` marks a run a scheduled task started: it is offered no schedule
         tools (no recursion) and, when the user pre-approved the sandbox, it starts with
         the computer already allowed so no consent card is shown. ``route_override`` names
-        the speakers for this one message (a group kick-off or the user's reroute).
+        the speakers for this one message (the user's own reroute).
         """
         if self.is_running(conversation_id):
             raise EngineBusy("该会话已有任务正在运行，请等待当前任务结束。")
@@ -351,6 +372,7 @@ class SupervisorEngine(
             task_id=task_id,
             task_instruction=task_instruction,
             route_override=list(route_override or []),
+            activity_parent=ACTIVITY.get(),
         )
         self._runs[conversation_id] = active
         active.task = asyncio.create_task(self._supervise(active))
@@ -630,26 +652,78 @@ class SupervisorEngine(
                 while pending and pending[0].cue == OPINION_CUE:
                     batch.append(pending.pop(0))
                 answered = await self._serve_opinions(active, conversation, roster, batch, pending, hops)
-                hops = self._queue_transfers(active, conversation, pending, hops)
+                hops = self._queue_transfers(
+                    active,
+                    conversation,
+                    pending,
+                    hops,
+                    last_agent_id=answered[-1][0]["id"] if answered else None,
+                )
                 for agent, message in answered:
                     replies.append(message)
                     if agent["name"] not in spoke:
                         spoke.append(agent["name"])
                 queued = {queued.agent_id for queued in pending}
                 targets: list[str] = []
+                outside: list[str] = []
                 for agent, message in answered:
                     for agent_id in message["mentions"]:
                         if agent_id != agent["id"] and agent_id not in queued and agent_id not in targets:
                             targets.append(agent_id)
-                if targets:
-                    if hops + len(targets) > MAX_HOPS:
-                        raise RunLimited(HOP_LIMIT_ERROR)
-                    hops += len(targets)
-                    at = next((i for i, slot in enumerate(pending) if slot.cue == "closing"), len(pending))
-                    pending[at:at] = [QueuedAgent(agent_id, answered[0][1]["id"]) for agent_id in targets]
-                    self._advance(active, None, pending, hops)
+                    for agent_id in self._outside_mentions(
+                        conversation, str(message["content"])
+                    ):
+                        if agent_id not in outside:
+                            outside.append(agent_id)
+                ref_agent = answered[-1][0] if answered else None
+                ref_message = answered[-1][1] if answered else None
+                extra = (
+                    1
+                    if outside
+                    and ref_agent is not None
+                    and self._invite_needs_supervisor(conversation, ref_agent)
+                    else 0
+                )
+                if targets or outside:
+                    if hops + len(targets) + extra > RELAY_HOPS:
+                        self._queue_conclusion(
+                            active,
+                            conversation,
+                            pending,
+                            hops,
+                            ref_agent["id"] if ref_agent else None,
+                            ref_message["id"] if ref_message else None,
+                        )
+                    else:
+                        hops += len(targets)
+                        at = next((i for i, slot in enumerate(pending) if slot.cue == "closing"), len(pending))
+                        pending[at:at] = [
+                            QueuedAgent(agent_id, answered[0][1]["id"])
+                            for agent_id in targets
+                        ]
+                        if outside and ref_agent is not None and ref_message is not None:
+                            hops = self._queue_outside_invite(
+                                active,
+                                conversation,
+                                pending,
+                                hops,
+                                ref_agent,
+                                ref_message,
+                                outside,
+                            )
+                        self._advance(active, None, pending, hops)
                 continue
             item = pending.pop(0)
+            if item.needs:
+                # An invite slot waits for the supervisor's membership change; if the person
+                # never joined (refused, failed), their turn is skipped and the reply explains.
+                fresh = self._store.get_conversation(conversation["id"]) or conversation
+                if any(agent_id not in fresh["member_ids"] for agent_id in item.needs):
+                    self._advance(active, None, pending, hops)
+                    continue
+                if fresh["member_ids"] != conversation["member_ids"]:
+                    conversation = fresh
+                    roster = self._roster(conversation)
             agent = self._store.get_agent(item.agent_id)
             if agent is None:  # the member was removed while it was queued
                 self._advance(active, None, pending, hops)
@@ -662,19 +736,24 @@ class SupervisorEngine(
                     conversation,
                     roster,
                     item.reply_to_id,
-                    closing=spoke if item.cue == "closing" else None,
+                    closing=spoke if item.cue in ("closing", CONCLUDE_CUE) else None,
+                    concluding=item.cue == CONCLUDE_CUE,
+                    focus=item.focus or None,
                 )
             else:
                 message = await self._member_reply(active, conversation, roster, agent, item)
-            hops = self._queue_transfers(active, conversation, pending, hops)
+            hops = self._queue_transfers(
+                active, conversation, pending, hops, last_agent_id=agent["id"]
+            )
             if message is None:  # a reaction-only reply is answered with no text
                 continue
             replies.append(message)
             if agent["kind"] != "supervisor" and agent["name"] not in spoke:
                 spoke.append(agent["name"])
-            if conversation["kind"] == "thread":
+            if conversation["kind"] == "thread" or item.cue == CONCLUDE_CUE:
                 # A thread belongs to one task: its result may name colleagues for the group,
-                # but that is a group hand-off, never another turn inside this thread.
+                # but that is a group hand-off, never another turn inside this thread. The
+                # conclusion is the last word either way: it may not start another relay.
                 continue
             queued = {queued.agent_id for queued in pending}
             targets = [
@@ -682,15 +761,24 @@ class SupervisorEngine(
                 for agent_id in message["mentions"]
                 if agent_id != agent["id"] and agent_id not in queued
             ]
-            if not targets:
+            outside = self._outside_mentions(conversation, str(message["content"]))
+            extra = 1 if self._invite_needs_supervisor(conversation, agent) and outside else 0
+            if not targets and not outside:
                 continue
-            if hops + len(targets) > MAX_HOPS:
-                raise RunLimited(HOP_LIMIT_ERROR)
+            if hops + len(targets) + extra > RELAY_HOPS:
+                self._queue_conclusion(
+                    active, conversation, pending, hops, agent["id"], message["id"]
+                )
+                continue
             hops += len(targets)
             # Someone @-ed answers before the supervisor's closing word, so the closing comes
             # last; without a closing slot the queue grows at its end, as it always has.
             at = next((i for i, queued in enumerate(pending) if queued.cue == "closing"), len(pending))
             pending[at:at] = [QueuedAgent(agent_id, message["id"]) for agent_id in targets]
+            if outside:
+                hops = self._queue_outside_invite(
+                    active, conversation, pending, hops, agent, message, outside
+                )
             self._advance(active, None, pending, hops)
         return replies
 
@@ -786,6 +874,139 @@ class SupervisorEngine(
                 return agent
         return None
 
+    # ------------------------------------------------------------------ invites
+
+    def _outside_mentions(self, conversation: dict, text: str) -> list[str]:
+        """Team agents @-ed in a bot's own words who are not in this group, in order."""
+        if not text:
+            return []
+        members = set(str(agent_id) for agent_id in conversation["member_ids"])
+        outside = [
+            agent
+            for agent in self._store.list_agents()
+            if str(agent["id"]) not in members
+        ]
+        return [
+            str(agent_id)
+            for agent_id in parse_mentions(text, outside)
+            if str(agent_id) not in members
+        ][: dispatch_rules.MAX_SPEAKERS]
+
+    def _invite_needs_supervisor(self, conversation: dict, author: Mapping[str, Any]) -> bool:
+        """Whether this @ to an outsider goes to the group's supervisor rather than the engine."""
+        boss = self._supervisor()
+        return bool(
+            boss is not None
+            and str(boss["id"]) in conversation["member_ids"]
+            and str(author.get("id")) != str(boss["id"])
+        )
+
+    def _add_members(self, active: ActiveRun, conversation: dict, agent_ids: Sequence[str]) -> dict:
+        """Pull team agents into the group, with the one quiet notice that says so."""
+        fresh = self._store.get_conversation(conversation["id"]) or conversation
+        wanted = [str(agent_id) for agent_id in agent_ids]
+        added = [agent_id for agent_id in wanted if agent_id not in fresh["member_ids"]]
+        if not added:
+            return fresh
+        members = [*fresh["member_ids"], *added]
+        updated = self._store.update_conversation(fresh["id"], member_ids=members) or fresh
+        names = "、".join(self._agent_name(agent_id) for agent_id in added)
+        self._append_notice(active, conversation, f"已把 {names} 拉进群")
+        self._publish_workspace()
+        return updated
+
+    def _append_invite_notice(
+        self,
+        active: ActiveRun,
+        conversation: dict,
+        agent_id: str,
+        message_id: str | None,
+    ) -> None:
+        """A quiet row offering 「拉进群」 when the group has no supervisor to decide it."""
+        name = self._agent_name(agent_id)
+        message = self._store.append_message(
+            conversation_id=conversation["id"],
+            author_id=None,
+            author_name="系统",
+            avatar_seed=None,
+            kind="notice",
+            content=f"{name} 不在这个群里",
+            status="complete",
+            run_id=active.run_id,
+            reply_to_id=message_id,
+            invite={"agent_id": agent_id, "name": name, "message_id": message_id},
+        )
+        self._publish_message("message_start", message)
+        self._publish_message("message_end", message)
+
+    def _queue_outside_invite(
+        self,
+        active: ActiveRun,
+        conversation: dict,
+        pending: list[QueuedAgent],
+        hops: int,
+        author: Mapping[str, Any],
+        message: Mapping[str, Any],
+        outside_ids: Sequence[str],
+    ) -> int:
+        """Turn a member's @ to an outsider into a pull-in turn, as the relay's next hop.
+
+        With a supervisor in the group it gets the membership turn and the invited bot answers
+        after it; without one the engine adds the person at once when the supervisor wrote the
+        @, and otherwise leaves a notice the user can confirm.
+        """
+        names = [self._agent_name(agent_id) for agent_id in outside_ids]
+        sentence = str(message.get("content") or "")
+        slots: list[QueuedAgent] = []
+        boss = self._supervisor()
+        if self._invite_needs_supervisor(conversation, author) and boss is not None:
+            slots.append(
+                QueuedAgent(
+                    str(boss["id"]),
+                    str(message["id"]),
+                    cue="invite",
+                    focus=prompts.bot_invite_instruction(
+                        str(author.get("name") or ""), names, sentence
+                    ),
+                )
+            )
+            for agent_id in outside_ids:
+                slots.append(
+                    QueuedAgent(
+                        str(agent_id),
+                        str(message["id"]),
+                        cue="turn",
+                        focus=prompts.bot_invited_focus_instruction(
+                            str(author.get("name") or ""), sentence
+                        ),
+                        needs=tuple(str(agent_id) for agent_id in outside_ids),
+                    )
+                )
+        elif boss is not None and str(boss["id"]) in conversation["member_ids"]:
+            # The supervisor itself @-ed them: it already has set_group_members.
+            fresh = self._add_members(active, conversation, outside_ids)
+            for agent_id in outside_ids:
+                if str(agent_id) not in fresh["member_ids"]:
+                    continue
+                slots.append(
+                    QueuedAgent(
+                        str(agent_id),
+                        str(message["id"]),
+                        cue="turn",
+                        focus=prompts.bot_invited_focus_instruction(str(boss["name"]), sentence),
+                    )
+                )
+        else:
+            # No supervisor to ask: the user gets the button instead of a silent drop.
+            for agent_id in outside_ids:
+                self._append_invite_notice(active, conversation, str(agent_id), str(message["id"]))
+            return hops
+        if not slots:
+            return hops
+        at = next((i for i, slot in enumerate(pending) if slot.cue == "closing"), len(pending))
+        pending[at:at] = slots
+        return hops + (1 if boss is not None and self._invite_needs_supervisor(conversation, author) else 0)
+
     # ------------------------------------------------------------------ replies
 
     async def _supervisor_reply(
@@ -796,12 +1017,15 @@ class SupervisorEngine(
         reply_to_id: str | None,
         *,
         closing: Sequence[str] | None = None,
+        concluding: bool = False,
+        focus: str | None = None,
     ) -> dict | None:
         """Run the supervisor's native tool loop until it produces a final answer.
 
         ``closing`` names the members who just spoke in a discussion (``ask_group``): its turn
-        then ends on a short closing word instead of a fresh answer. A progress question never
-        reaches here: the dispatcher's card answers it with no agent at all.
+        then ends on a short closing word instead of a fresh answer. ``concluding`` is the
+        turn after a spent relay: it writes the user a short conclusion and may not @ anyone.
+        A progress question never reaches here: the dispatcher's card answers it with no agent.
         """
         author = self._supervisor()
         # notify_user is allowed once per bot turn, and this reply starts a fresh turn.
@@ -809,16 +1033,25 @@ class SupervisorEngine(
         trigger = self._trigger_text(active, conversation)
         # The closing speaks to the message its slot answers: the user's, or the question a bot
         # brought to this group (``ask_group``).
-        answered = self._store.get_message(reply_to_id) if closing and reply_to_id else None
-        cue = (
-            prompts.closing_instruction(
-                answered["content"],
-                closing,
-                None if answered["kind"] == "user" else answered["author_name"],
-            )
-            if closing and answered is not None
+        answered = (
+            self._store.get_message(reply_to_id)
+            if (closing or concluding) and reply_to_id
             else None
         )
+        if focus is not None:
+            cue = focus
+        elif concluding and answered is not None:
+            cue = prompts.relay_conclusion_instruction(answered["content"], closing or ())
+        else:
+            cue = (
+                prompts.closing_instruction(
+                    answered["content"],
+                    closing,
+                    None if answered["kind"] == "user" else answered["author_name"],
+                )
+                if closing and answered is not None
+                else None
+            )
 
         def context() -> list[dict[str, Any]]:
             return self._supervisor_context(conversation, trigger=trigger, cue=cue)
@@ -845,7 +1078,7 @@ class SupervisorEngine(
         reply_mood: str | None = None
         reply_images: list[str] = []
         reply_reaction: str | None = None
-        with self._turn(active, author) as turn:
+        async with self._activity_turn(active, conversation, author, reply_to_id) as turn:
             while True:
                 if active.stop_requested:
                     raise RunStopped("任务已停止。")
@@ -891,7 +1124,7 @@ class SupervisorEngine(
                 else:
                     said = [body]
                     reply_mood, reply_images, reply_reaction = mood, images, reaction
-                    nudge = not calls and self._should_nudge(
+                    nudge = not calls and not concluding and self._should_nudge(
                         active, author, tools_now, body, nudged
                     )
                     if current is not None and not nudge:
@@ -975,6 +1208,11 @@ class SupervisorEngine(
                 await self._resume_thread_task(threaded, agent, item)
                 return None
         trigger = self._trigger_text(active, conversation)
+        note = item.focus or (
+            prompts.relay_conclusion_instruction(answering["content"], ())
+            if item.cue == CONCLUDE_CUE and answering is not None
+            else None
+        )
         messages = await self._turn_context(
             active,
             conversation,
@@ -989,10 +1227,17 @@ class SupervisorEngine(
                 opinion=item.cue == OPINION_CUE,
                 hidden=self._sibling_answers(conversation, item.reply_to_id, blind_to),
                 trigger=trigger,
+                note=note,
             ),
         )
         _, message = await self._member_call(
-            active, conversation, agent, messages, item.reply_to_id, roster
+            active,
+            conversation,
+            agent,
+            messages,
+            item.reply_to_id,
+            roster,
+            concluding=item.cue == CONCLUDE_CUE,
         )
         return message
 
@@ -1090,24 +1335,6 @@ class SupervisorEngine(
         return await self.task_scheduler.enqueue(
             task["id"], instruction=instruction, another_round=True
         )
-
-    def _kick_off_group(self, group: dict, message: dict) -> None:
-        """A new group's opening: its members answer it side by side, through its own run."""
-        members = [
-            str(agent_id)
-            for agent_id in group["member_ids"]
-            if self._store.get_agent(agent_id) is not None
-        ]
-        if not members or self.launcher is None:
-            return
-        run = self._store.begin_bare_run(group["id"], "群组开场")
-        self._store.update_run(run["id"], current_agent_id=members[0])
-        try:
-            self.start(
-                run["id"], group["id"], message_id=message["id"], route_override=members
-            )
-        except EngineBusy:  # pragma: no cover - a brand-new group has no run
-            self._store.discard_run(run["id"])
 
     async def _start_task(
         self, active: ActiveRun, task: dict | None, title: str, plan: str
@@ -1580,7 +1807,13 @@ class SupervisorEngine(
         self._publish_workspace()
 
     def _queue_transfers(
-        self, active: ActiveRun, conversation: dict, pending: list[QueuedAgent], hops: int
+        self,
+        active: ActiveRun,
+        conversation: dict,
+        pending: list[QueuedAgent],
+        hops: int,
+        *,
+        last_agent_id: str | None = None,
     ) -> int:
         """Queue the new owner of every task handed on during the last turn(s)."""
         while active.transfers:
@@ -1588,8 +1821,14 @@ class SupervisorEngine(
             task = self._store.get_group_task(task_id)
             if task is None:
                 continue
-            if hops + 1 > MAX_HOPS:
-                raise RunLimited(HOP_LIMIT_ERROR)
+            if hops + 1 > RELAY_HOPS:
+                # The relay budget is spent: the last bot (or the supervisor) closes instead
+                # of handing the task on again; further hand-offs wait for the next message.
+                active.transfers.clear()
+                self._queue_conclusion(
+                    active, conversation, pending, hops, last_agent_id, task["request_message_id"]
+                )
+                break
             hops += 1
             at = next((i for i, slot in enumerate(pending) if slot.cue == "closing"), len(pending))
             pending.insert(
@@ -1600,6 +1839,34 @@ class SupervisorEngine(
             )
             self._advance(active, None, pending, hops)
         return hops
+
+    def _queue_conclusion(
+        self,
+        active: ActiveRun,
+        conversation: dict,
+        pending: list[QueuedAgent],
+        hops: int,
+        last_agent_id: str | None,
+        reply_to_id: str | None,
+    ) -> None:
+        """After the relay limit, one last turn writes the user a short conclusion."""
+        if any(slot.cue == CONCLUDE_CUE for slot in pending):
+            return
+        target = self._conclusion_speaker(conversation, last_agent_id)
+        if target is None:
+            return
+        pending.append(QueuedAgent(target, reply_to_id, cue=CONCLUDE_CUE))
+        self._advance(active, None, pending, hops)
+
+    def _conclusion_speaker(self, conversation: dict, last_agent_id: str | None) -> str | None:
+        """Who closes a spent relay: the supervisor in this group, else the bot that just spoke."""
+        known = {str(agent["id"]) for agent in self._roster(conversation)}
+        boss = self._store.supervisor()
+        if boss is not None and str(boss["id"]) in known:
+            return str(boss["id"])
+        if last_agent_id and last_agent_id in known:
+            return last_agent_id
+        return None
 
     async def _assign_part(
         self,
@@ -1873,6 +2140,7 @@ class SupervisorEngine(
         role: str = "member",
         limited_into: dict[str, str] | None = None,
         surface: dict | None = None,
+        concluding: bool = False,
     ) -> tuple[str, dict | None]:
         """Run one bot's native tool loop, streaming text before and after calls.
 
@@ -1893,7 +2161,7 @@ class SupervisorEngine(
         reply_reaction: str | None = None
         self._add_continue_cue(messages, active)
         active.notified.discard((conversation["id"], agent["id"]))
-        with self._turn(active, agent) as turn:
+        async with self._activity_turn(active, conversation, agent, reply_to_id) as turn:
             while True:
                 if active.stop_requested:
                     raise RunStopped("任务已停止。")
@@ -1940,7 +2208,7 @@ class SupervisorEngine(
                 else:
                     said = [body]
                     reply_mood, reply_images, reply_reaction = mood, images, reaction
-                    nudge = not calls and self._should_nudge(
+                    nudge = not calls and not concluding and self._should_nudge(
                         active, agent, tools_now, body, nudged
                     )
                     if current is not None and not nudge:
@@ -2142,6 +2410,14 @@ class SupervisorEngine(
         if call.name != START_TASK:
             # Opening the task is the group turn's own decision, not one of its work steps.
             self._note_task_step(active, f"正在{label}")
+        # The turn's card says what it is doing right now: the call's own words when it has
+        # them (「运行「npm init -y」」), else the tool's category.
+        step = f"正在{label}"
+        if handler is not None:
+            try:
+                step = getattr(handler.parse(call.arguments), "summary", None) or step
+            except Exception:
+                pass
         self._publish_run(active)
         action, action_message = self._store.create_action(
             run_id=active.run_id,
@@ -2153,8 +2429,12 @@ class SupervisorEngine(
             author_id=author["id"],
             author_name=author["name"],
             avatar_seed=author["avatar_seed"],
+            activity_id=ACTIVITY.get(),
         )
         self._publish_message("message_start", action_message)
+        # After the row exists, so the card's ``current_tool`` names this call, not the last.
+        self._note_activity_step(active, step)
+        self._maybe_rename_activity(ACTIVITY.get())
         if active.background:
             # Nobody sees this row; the schedules panel reads the run's step instead.
             self._set_step(active, f"「{author['name']}」正在{label}")
@@ -2630,6 +2910,7 @@ class SupervisorEngine(
             author_id=author["id"],
             author_name=author["name"],
             avatar_seed=author["avatar_seed"],
+            activity_id=ACTIVITY.get(),
         )
         self._publish_message("message_start", message)
         self._finish_action(
@@ -2725,7 +3006,7 @@ class SupervisorEngine(
             if str(agent_id) in known
         ]
         if conversation["kind"] == "group" and active.route_override:
-            # A re-dispatch (or a new group's kick-off) names its speakers itself.
+            # A re-dispatch names its speakers itself.
             speakers = [
                 agent_id for agent_id in active.route_override if agent_id in known
             ]
@@ -2771,10 +3052,87 @@ class SupervisorEngine(
             decision = dispatch_rules.everyone(members)
             self._record_route(trigger, decision)
             return self._queue_for(decision, reply_to)
+        if not addressed:
+            # 「继续」 goes back to the bot whose work the last stop cut short, with no call.
+            interrupted = self._interrupted_agent(conversation, roster)
+            if interrupted and is_continue(
+                self._strip_mentions(str(trigger.get("content") or ""), conversation)
+            ):
+                self._store.clear_interrupted_agent(conversation["id"])
+                decision = dispatch_rules.Decision(
+                    kind=dispatch_rules.KIND_ANSWER,
+                    speakers=(interrupted,),
+                    reason="接着刚才被打断的成员继续。",
+                )
+                self._record_route(trigger, decision)
+                return self._queue_for(decision, reply_to)
+        self._mark_route_pending(trigger)
+        self._set_step(active, "正在决定谁来接")
         decision = await self._dispatch_decision(active, conversation, roster, trigger, addressed)
+        decision = self._with_user_invites(conversation, roster, trigger, decision)
         if self._store.get_message(trigger["id"]) is not None:
             self._record_route(trigger, decision)
         return await self._apply_decision(active, conversation, roster, decision, trigger, addressed)
+
+    def _with_user_invites(
+        self,
+        conversation: dict,
+        roster: Sequence[Mapping[str, str]],
+        trigger: dict,
+        decision: dispatch_rules.Decision,
+    ) -> dispatch_rules.Decision:
+        """Make sure the user's @ to someone outside the group becomes an invite slice."""
+        content = str(trigger.get("content") or "")
+        outside = self._outside_mentions(conversation, content)
+        if not outside:
+            return decision
+        already = {
+            agent_id for intent in decision.intents for agent_id in intent.invite
+        }
+        missing = [agent_id for agent_id in outside if agent_id not in already]
+        if not missing:
+            return decision
+        text = " ".join(content.split())[: dispatch_rules.INTENT_TEXT_CHARS]
+        invite = dispatch_rules.Intent(
+            text=text,
+            kind=dispatch_rules.KIND_INVITE,
+            speakers=tuple(missing),
+            invite=tuple(missing),
+        )
+        heads = list(decision.intents)
+        if not heads:
+            if decision.speakers and decision.kind == dispatch_rules.KIND_ANSWER:
+                heads.append(
+                    dispatch_rules.Intent(
+                        text=text,
+                        kind=dispatch_rules.KIND_ANSWER,
+                        speakers=decision.speakers,
+                    )
+                )
+            elif decision.kind in (dispatch_rules.KIND_STEER, dispatch_rules.KIND_RESUME):
+                heads.append(
+                    dispatch_rules.Intent(
+                        text=text,
+                        kind=decision.kind,
+                        task_id=decision.task_id,
+                    )
+                )
+            elif decision.kind == dispatch_rules.KIND_STATUS:
+                heads.append(dispatch_rules.Intent(text=text, kind=decision.kind))
+        intents = tuple([*heads, invite][: dispatch_rules.MAX_INTENTS])
+        speakers: list[str] = []
+        for intent in intents:
+            for agent_id in intent.speakers:
+                if agent_id not in speakers:
+                    speakers.append(agent_id)
+        return dispatch_rules.Decision(
+            kind=dispatch_rules.KIND_ANSWER,
+            speakers=tuple(speakers),
+            opinions=decision.opinions,
+            reason=decision.reason,
+            by=decision.by,
+            intents=intents,
+        )
 
     def _queue_for(self, decision: dispatch_rules.Decision, reply_to: str) -> list[QueuedAgent]:
         """The run's queue for one answer decision: side by side, or in the decided order."""
@@ -2793,6 +3151,10 @@ class SupervisorEngine(
         addressed: Sequence[str],
     ) -> list[QueuedAgent]:
         """Carry out one decision: reply, steer into a task, resume a task, a card, or silence."""
+        if decision.intents:
+            return await self._apply_intents(
+                active, conversation, roster, decision, trigger, addressed
+            )
         if decision.kind == dispatch_rules.KIND_NONE:
             return []
         if decision.kind == dispatch_rules.KIND_STATUS:
@@ -2807,13 +3169,190 @@ class SupervisorEngine(
         elif self._queue_for(decision, trigger["id"]):
             return self._queue_for(decision, trigger["id"])
         # The task stopped existing, or steer/resume was refused: someone still answers.
-        last = self._last_speaker(conversation)
-        first = self._first_member(conversation, roster)
-        rescue = dispatch_rules.fallback(addressed, last["id"] if last else None, first)
+        rescue = self._fallback_decision(conversation, roster, addressed)
         if rescue is None:
             return []
         self._record_route(trigger, rescue)
         return self._queue_for(rescue, trigger["id"])
+
+    async def _apply_intents(
+        self,
+        active: ActiveRun,
+        conversation: dict,
+        roster: Sequence[Mapping[str, str]],
+        decision: dispatch_rules.Decision,
+        trigger: dict,
+        addressed: Sequence[str],
+    ) -> list[QueuedAgent]:
+        """Run one user message's slices in order, each with the focus it is owed."""
+        members = {str(agent["id"]) for agent in roster}
+        intents = decision.intents
+        pending: list[QueuedAgent] = []
+        posted_status = False
+        queued_any = False
+        for index, intent in enumerate(intents):
+            if intent.kind == dispatch_rules.KIND_STATUS:
+                if not posted_status:
+                    self._post_status_card(active, conversation)
+                    posted_status = True
+                continue
+            if intent.kind == dispatch_rules.KIND_STEER:
+                if await self._steer_task(conversation, intent.task_id, trigger):
+                    queued_any = True
+                    continue
+            elif intent.kind == dispatch_rules.KIND_RESUME:
+                if await self._resume_task(conversation, intent.task_id, trigger):
+                    queued_any = True
+                    continue
+            if intent.kind == dispatch_rules.KIND_INVITE:
+                invites = [agent_id for agent_id in intent.invite if agent_id not in members]
+                if invites:
+                    pending.extend(
+                        self._intent_invite_slots(
+                            active, conversation, intent, invites, trigger, intents, index
+                        )
+                    )
+                    queued_any = True
+                    continue
+            speakers = [
+                agent_id
+                for agent_id in (*intent.speakers, *intent.invite)
+                if agent_id in members
+            ]
+            if not speakers:
+                continue
+            focus = prompts.intent_focus_instruction(
+                intent.text or str(trigger.get("content") or ""),
+                self._other_intent_names(intents, index, members),
+            )
+            cue = (
+                OPINION_CUE
+                if decision.opinions and len(speakers) > 1
+                else "turn"
+            )
+            pending.extend(
+                QueuedAgent(agent_id, trigger["id"], cue=cue, focus=focus)
+                for agent_id in speakers
+            )
+            queued_any = True
+        # A member the user addressed answers even if no intent named them: that rule is the
+        # one thing the model may not override.
+        queued = {slot.agent_id for slot in pending}
+        missing = [
+            agent_id
+            for agent_id in addressed
+            if agent_id in members and agent_id not in queued
+        ]
+        if missing:
+            focus = prompts.intent_focus_instruction(str(trigger.get("content") or ""))
+            pending.extend(
+                QueuedAgent(agent_id, trigger["id"], cue="turn", focus=focus)
+                for agent_id in missing
+            )
+        if pending:
+            return pending
+        if posted_status or queued_any:
+            return []
+        rescue = self._fallback_decision(conversation, roster, addressed)
+        if rescue is None:
+            return []
+        self._record_route(trigger, rescue)
+        return self._queue_for(rescue, trigger["id"])
+
+    def _other_intent_names(
+        self,
+        intents: Sequence[dispatch_rules.Intent],
+        index: int,
+        members: set[str],
+    ) -> list[str]:
+        """The people the other slices went to, for this turn's focus line."""
+        names: list[str] = []
+        for other_index, other in enumerate(intents):
+            if other_index == index:
+                continue
+            for agent_id in (*other.speakers, *other.invite):
+                name = self._agent_name(agent_id) if agent_id in members else None
+                if name and name not in names:
+                    names.append(name)
+        return names
+
+    def _intent_invite_slots(
+        self,
+        active: ActiveRun,
+        conversation: dict,
+        intent: dispatch_rules.Intent,
+        invites: Sequence[str],
+        trigger: dict,
+        intents: Sequence[dispatch_rules.Intent],
+        index: int,
+    ) -> list[QueuedAgent]:
+        """The supervisor's pull-in turn, then the invited bot's own slice."""
+        names = [self._agent_name(agent_id) for agent_id in invites]
+        text = intent.text or str(trigger.get("content") or "")
+        boss = self._supervisor()
+        slots: list[QueuedAgent] = []
+        supervisor_in_group = bool(
+            boss is not None and str(boss["id"]) in conversation["member_ids"]
+        )
+        others = self._other_intent_names(intents, index, set(conversation["member_ids"]))
+        if supervisor_in_group and boss is not None and str(boss["id"]) not in invites:
+            slots.append(
+                QueuedAgent(
+                    str(boss["id"]),
+                    trigger["id"],
+                    cue="invite",
+                    focus=prompts.invite_instruction(names, text),
+                )
+            )
+            for agent_id in invites:
+                slots.append(
+                    QueuedAgent(
+                        str(agent_id),
+                        trigger["id"],
+                        cue="turn",
+                        focus=prompts.invited_focus_instruction(
+                            text, [str(boss["name"]), *others]
+                        ),
+                        needs=tuple(str(agent_id) for agent_id in invites),
+                    )
+                )
+            # The slice may also name someone already here ("让画师辅助匠师"): they take it too.
+            for agent_id in intent.speakers:
+                if agent_id in conversation["member_ids"] and agent_id not in invites:
+                    slots.append(
+                        QueuedAgent(
+                            agent_id,
+                            trigger["id"],
+                            cue="turn",
+                            focus=prompts.intent_focus_instruction(text, others),
+                        )
+                    )
+            return slots
+        # No supervisor to ask (or it is the one being invited): the engine adds them itself.
+        fresh = self._add_members(active, conversation, invites)
+        added = [str(agent_id) for agent_id in invites if str(agent_id) in fresh["member_ids"]]
+        for agent_id in added:
+            slots.append(
+                QueuedAgent(
+                    agent_id,
+                    trigger["id"],
+                    cue="turn",
+                    focus=prompts.invited_focus_instruction(text, others),
+                    needs=tuple(added),
+                )
+            )
+        # A slice may also name someone already here ("让画师辅助匠师"): they take it too.
+        for agent_id in intent.speakers:
+            if agent_id in fresh["member_ids"] and agent_id not in added:
+                slots.append(
+                    QueuedAgent(
+                        agent_id,
+                        trigger["id"],
+                        cue="turn",
+                        focus=prompts.intent_focus_instruction(text, others),
+                    )
+                )
+        return slots
 
     async def _dispatch_decision(
         self,
@@ -2824,11 +3363,9 @@ class SupervisorEngine(
         addressed: Sequence[str],
     ) -> dispatch_rules.Decision:
         """One no-tool call decides who answers, or the deterministic fallback does."""
-        last = self._last_speaker(conversation)
-        first = self._first_member(conversation, roster)
         decision = await self._dispatch_call(active, conversation, roster, trigger, addressed)
         if decision is None:
-            rescue = dispatch_rules.fallback(addressed, last["id"] if last else None, first)
+            rescue = self._fallback_decision(conversation, roster, addressed)
             assert rescue is not None  # every group keeps at least one member
             return rescue
         return dispatch_rules.normalize(decision, addressed)
@@ -2852,6 +3389,13 @@ class SupervisorEngine(
             else None
         )
         tasks = self._open_task_lines(conversation)
+        interrupted = self._interrupted_agent(conversation, roster)
+        member_ids = {str(agent["id"]) for agent in roster}
+        outside = [
+            agent
+            for agent in self._store.list_agents()
+            if str(agent["id"]) not in member_ids
+        ]
         context = {
             "group": {
                 "title": conversation["title"],
@@ -2869,12 +3413,23 @@ class SupervisorEngine(
                 }
                 for agent in roster
             ],
+            "team_outside": [
+                {
+                    "id": str(agent["id"]),
+                    "name": agent["name"],
+                    "instructions": " ".join(str(agent["instructions"]).split())[
+                        : dispatch_rules.INSTRUCTION_CHARS
+                    ],
+                }
+                for agent in outside
+            ],
             "absent": self._absent_names(conversation),
             "addressed": [
                 {"id": agent_id, "name": self._agent_name(agent_id)} for agent_id in addressed
             ],
             "quoting": (quoted or {}).get("author_name"),
             "last_speaker": last["name"] if last is not None else None,
+            "interrupted": self._agent_name(interrupted) if interrupted else None,
             "recent": self._recent_group_lines(conversation, limit=12),
             "tasks": tasks,
             "message": str(trigger.get("content") or ""),
@@ -2887,6 +3442,13 @@ class SupervisorEngine(
             "instructions": "",
             "avatar_seed": None,
         }
+        provider = self._store.get_provider(model.provider_id)
+        caps = model_caps(provider, model.model, self._settings) if provider is not None else None
+        effort = (
+            dispatch_rules.reasoning_effort(caps.reasoning, caps.reasoning_levels)
+            if caps is not None
+            else None
+        )
         stream = self._completion(
             messages,
             tools=None,
@@ -2894,6 +3456,7 @@ class SupervisorEngine(
             purpose="dispatch",
             max_tokens=dispatch_rules.MAX_TOKENS,
             model=model,
+            reasoning_effort=effort,
         )
         pieces: list[str] = []
 
@@ -2906,15 +3469,28 @@ class SupervisorEngine(
             await asyncio.wait_for(collect(), timeout=dispatch_rules.TIMEOUT_SECONDS)
         except RunStopped:
             raise
-        except (asyncio.TimeoutError, UpstreamError) as exc:
+        except asyncio.TimeoutError:
+            logger.warning("群组分发失败：TimeoutError")
+            self._store.record_dispatch_failure("TimeoutError")
+            return None
+        except UpstreamError as exc:
             logger.warning("群组分发失败：%s", type(exc).__name__)
+            self._store.record_dispatch_failure("UpstreamError")
             return None
         finally:
             self._record_dispatch_usage(active, conversation, stream)
         task_ids = [str(task["id"]) for task in tasks]
-        return dispatch_rules.parse(
-            "".join(pieces), member_ids=[str(agent["id"]) for agent in roster], task_ids=task_ids
+        answer = "".join(pieces)
+        decision = dispatch_rules.parse(
+            answer,
+            member_ids=[str(agent["id"]) for agent in roster],
+            task_ids=task_ids,
+            invite_ids=[str(agent["id"]) for agent in outside],
         )
+        if decision is None:
+            logger.warning("群组分发结果读不懂：%s", " ".join(answer.split())[:300])
+            self._store.record_dispatch_failure("Unreadable")
+        return decision
 
     def _record_dispatch_usage(self, active: ActiveRun, conversation: dict, stream: Any) -> None:
         """One usage row for the dispatcher, under no bot: routing is not anyone's budget."""
@@ -2980,6 +3556,52 @@ class SupervisorEngine(
         updated = self._store.set_message_route(trigger["id"], decision.route())
         if updated is not None:
             self._publish_message("message_end", updated)
+
+    def _mark_route_pending(self, trigger: dict) -> None:
+        """Say the message is being routed, before the dispatcher's call has an answer."""
+        updated = self._store.set_message_route(trigger["id"], {"pending": True})
+        if updated is not None:
+            self._publish_message("message_end", updated)
+
+    def _fallback_decision(
+        self,
+        conversation: dict,
+        roster: Sequence[Mapping[str, str]],
+        addressed: Sequence[str],
+    ) -> dispatch_rules.Decision | None:
+        """The deterministic route when the dispatcher gives nothing usable."""
+        last = self._last_speaker(conversation)
+        return dispatch_rules.fallback(
+            addressed,
+            self._last_reply_mentions(conversation, roster),
+            self._interrupted_agent(conversation, roster),
+            last["id"] if last is not None else None,
+            self._first_member(conversation, roster),
+        )
+
+    def _last_reply_mentions(
+        self, conversation: dict, roster: Sequence[Mapping[str, str]]
+    ) -> list[str]:
+        """Who the newest bot reply @-ed, if they are still in this group."""
+        known = [str(agent["id"]) for agent in roster]
+        member_ids = set(known)
+        for row in reversed(self._store.list_messages(conversation["id"])):
+            if row["kind"] != "agent" or row.get("author_id") not in member_ids:
+                continue
+            return [
+                agent_id
+                for agent_id in (str(item) for item in row.get("mentions") or [])
+                if agent_id in member_ids
+            ][: dispatch_rules.MAX_SPEAKERS]
+        return []
+
+    def _interrupted_agent(
+        self, conversation: dict, roster: Sequence[Mapping[str, str]]
+    ) -> str | None:
+        """The bot a stopped turn cut short, while it is still a member of this group."""
+        agent_id = self._store.interrupted_agent(conversation["id"])
+        known = {str(agent["id"]) for agent in roster}
+        return agent_id if agent_id and agent_id in known else None
 
     def _first_member(
         self, conversation: dict, roster: Sequence[Mapping[str, str]] | None = None
@@ -3083,11 +3705,13 @@ class SupervisorEngine(
         assigner: str | None = None,
         trigger: str = "",
         workflow: str = "",
+        note: str | None = None,
     ) -> list[dict[str, Any]]:
         """Only this member's instructions, this conversation's history and its trigger.
 
         ``hidden`` drops rows from the history (sibling opinions on the same message);
         ``opinion`` asks for this member's own view rather than a reply to the others.
+        ``note`` is a final cue for this turn alone (e.g. the relay's closing instruction).
         """
         peer = self._peer(conversation, agent)
         system = prompts.member_system(
@@ -3139,6 +3763,12 @@ class SupervisorEngine(
                     ),
                 }
             )
+        if note:
+            # One closing cue for this turn, appended to the user turn the model reads last.
+            if messages and messages[-1].get("role") == "user":
+                messages[-1]["content"] = f"{messages[-1]['content']}\n\n{note}"
+            else:
+                messages.append({"role": "user", "content": note})
         history.attach_runtime(
             messages,
             moment=self._now(),
@@ -3540,7 +4170,6 @@ class SupervisorEngine(
                 active, group, author, agent, instruction, parent, action_message_id
             ),
             start_task=lambda task, title, plan: self._start_task(active, task, title, plan),
-            kick_off=self._kick_off_group,
             group_busy=lambda conversation_id: conversation_id != active.conversation_id
             and self.is_running(conversation_id),
             review_member=lambda conversation, agent, task, messages, reply_to_id, roster, text, message: self._review_member_answer(
@@ -3569,6 +4198,7 @@ class SupervisorEngine(
         model: ResolvedModel | None = None,
         conversation: dict | None = None,
         active: ActiveRun | None = None,
+        reasoning_effort: str | None = None,
     ) -> ModelStream:
         """Resolve this bot's model once per call, then open the matching protocol stream.
 
@@ -3605,6 +4235,7 @@ class SupervisorEngine(
             session=session,
             prompt_messages=prompt_messages,
             cli_tools=bridge,
+            reasoning_effort=reasoning_effort,
         )
         if remember is not None:
             # Called once the turn is known to have succeeded: a failed attempt must leave
@@ -3793,6 +4424,7 @@ class SupervisorEngine(
             avatar_seed=author["avatar_seed"],
             status="awaiting",
             confirmation={"prompt": prompt, "confirm_label": "继续", "deny_label": "停下"},
+            activity_id=ACTIVITY.get(),
         )
         self._publish_message("message_start", message)
         self._set_step(active, f"等待你确认「{author['name']}」超出预算")
@@ -3822,6 +4454,7 @@ class SupervisorEngine(
         updated = self._store.update_run(active.run_id, current_step=step)
         if updated is not None:
             self._report(active, updated)
+        self._note_activity_step(active, step)
         if active.task_id:
             # A thread run's own step (including waiting on the screen) is the card's line.
             task = self._store.get_group_task(active.task_id)
@@ -3938,6 +4571,60 @@ class SupervisorEngine(
             active, conversation, prompts.turn_limited_notice(turn.agent_name, turn.tool_calls)
         )
 
+    def _note_stop_line(self, active: ActiveRun, conversation: dict) -> None:
+        """A stopped turn that had tool steps but no answer leaves one short line.
+
+        The user then sees what was found so far instead of a wall of action rows with no
+        sentence. The bot is remembered on the conversation, so a following 「继续」 goes
+        back to it rather than to whoever the dispatcher would pick next.
+        """
+        run = self._store.get_run(active.run_id)
+        agent_id = str((run or {}).get("current_agent_id") or "")
+        rows = [
+            message
+            for message in self._store.list_messages(conversation["id"])
+            if message.get("run_id") == active.run_id
+        ]
+        actions = [message for message in rows if message["kind"] == "action"]
+        if not agent_id and actions:
+            agent_id = str(actions[-1].get("author_id") or "")
+        if not agent_id:
+            return
+        agent = self._store.get_agent(agent_id)
+        if agent is None:
+            return
+        if conversation["kind"] == "group":
+            self._store.set_interrupted_agent(conversation["id"], agent_id)
+        answered = any(
+            message["kind"] == "agent"
+            and message.get("status") == "complete"
+            and not message.get("leads_to_tools")
+            for message in rows
+        )
+        if answered or not actions:
+            return
+        summaries = [
+            " ".join(str((message.get("action") or {}).get("summary") or "").split())
+            for message in actions
+        ]
+        found = next((summary for summary in reversed(summaries) if summary), "")
+        if len(found) > 60:
+            found = found[:59] + "…"
+        message = self._store.append_message(
+            conversation_id=conversation["id"],
+            author_id=agent["id"],
+            author_name=agent["name"],
+            avatar_seed=agent["avatar_seed"],
+            kind="agent",
+            content=prompts.stop_line(found),
+            status="complete",
+            reply_to_id=active.trigger_message_id,
+            run_id=active.run_id,
+        )
+        active.replies.append((agent["id"], message["id"]))
+        self._publish_message("message_start", message)
+        self._publish_message("message_end", message)
+
     def _append_notice(self, active: ActiveRun, conversation: dict, content: str) -> None:
         """A quiet system-authored line in the chat, e.g. why a call switched models."""
         if active.background:
@@ -3975,6 +4662,7 @@ class SupervisorEngine(
             status=status,
             reply_to_id=reply_to_id,
             run_id=active.run_id,
+            activity_id=ACTIVITY.get(),
         )
         active.streaming_ids.add(message["id"])
         active.replies.append((author["id"], message["id"]))
@@ -4056,6 +4744,7 @@ class SupervisorEngine(
         self._publish_message("message_end", message)
         if waiting:
             self.publish_decisions()
+        self._sync_activity_awaiting(message.get("activity_id"))
         self._refresh_task_progress()
 
     def _record_unexecuted(
@@ -4080,6 +4769,7 @@ class SupervisorEngine(
             author_name=who["name"],
             avatar_seed=who["avatar_seed"],
             status="error",
+            activity_id=ACTIVITY.get(),
         )
         self._publish_message("message_start", message)
         self._finish_action(
@@ -4121,6 +4811,9 @@ class SupervisorEngine(
             self._publish_message("message_end", message)
         active.streaming_ids.clear()
         self._store.interrupt_actions(active.run_id, reason)
+        conversation = self._store.get_conversation(active.conversation_id)
+        if status == "stopped" and not active.background and conversation is not None:
+            self._note_stop_line(active, conversation)
         updated = self._store.update_run(
             active.run_id,
             status=status,
@@ -4133,7 +4826,6 @@ class SupervisorEngine(
         )
         if status == "limited" and not active.background and not active.turn_wrapped:
             # A turn's own notice already said it; only the run-level stop needs its own line.
-            conversation = self._store.get_conversation(active.conversation_id)
             if conversation is not None:
                 steps = int((updated or {}).get("tool_calls") or 0)
                 self._append_notice(
@@ -4144,6 +4836,7 @@ class SupervisorEngine(
         self._flush_task_text(active)
         self._settle_workflow(active, status, error)
         self._settle_group_tasks(active, status, error)
+        self._settle_activities(active, status, error)
         if active.background:
             self._deliver_summary(active, status, error)
         if self._runs.get(active.conversation_id) is active:

@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 from .host_browser import HostBrowser
 
@@ -111,7 +112,10 @@ def _quote(text: str) -> str:
 class HostComputer:
     """Shell, and on a Mac the screen, of the machine this process runs on."""
 
-    def __init__(self) -> None:
+    def __init__(self, default_cwd: Callable[[], str | Path] | None = None) -> None:
+        # A shell call with no cwd starts in the workspace's working folder, not the user's
+        # home: scratch files and experiments belong there, never in the home directory.
+        self._default_cwd = default_cwd
         self._lock = threading.Lock()
         # One run's commands never kill or overwrite another's: each call registers its own
         # process under its run id, and a cancel names that run.
@@ -203,7 +207,13 @@ class HostComputer:
         if not command.strip():
             return {"ok": False, "error": "没有要运行的命令。"}
         timeout = min(max(int(args.get("timeout") or 60), 1), MAX_SHELL_SECONDS)
-        cwd = Path(str(args.get("cwd") or Path.home())).expanduser()
+        raw_cwd = args.get("cwd")
+        if not raw_cwd and self._default_cwd is not None:
+            try:
+                raw_cwd = self._default_cwd()
+            except OSError:
+                raw_cwd = None
+        cwd = Path(str(raw_cwd or Path.home())).expanduser()
         if not cwd.is_dir():
             return {"ok": False, "error": f"目录「{cwd}」不存在。"}
         stop = self._stop_for(run_id)

@@ -7,6 +7,8 @@ import { FOLLOW_DEFAULT, modelGroups, modelOptionText, modelValue, parseModelVal
 import { useSegmentedThumb } from "../lib/motion";
 import { SEND_MODES } from "../lib/sendMode";
 import { supervisorName } from "../lib/team";
+import { clockTime } from "../lib/time";
+import { dispatchFailureWord } from "../lib/routeHint";
 import { store, useTeam } from "../state/store";
 import { Switch } from "./Connectors";
 
@@ -64,6 +66,14 @@ export function TeamSettingsSection() {
   }
 
   const dispatchPick = settings.dispatch_model;
+  const dispatchHealth = settings.dispatch_health;
+  // One line in words, not a log: how many failed and why the newest one did.
+  const dispatchWarning =
+    dispatchHealth && dispatchHealth.failures_24h > 0
+      ? `最近 24 小时分发失败 ${dispatchHealth.failures_24h} 次（最近一次：${dispatchFailureWord(dispatchHealth.last_error)}${
+          dispatchHealth.last_at ? `，${clockTime(dispatchHealth.last_at)}` : ""
+        }）`
+      : null;
   const dispatchListed =
     dispatchPick === null ||
     providers === null ||
@@ -229,6 +239,13 @@ export function TeamSettingsSection() {
             </optgroup>
           ))}
         </select>
+        {/* Quiet, but never hidden: a dispatcher that keeps failing is why a group's messages
+            land on whoever spoke last. */}
+        {dispatchWarning && (
+          <p className="dispatch-health" role="status">
+            {dispatchWarning}
+          </p>
+        )}
       </section>
 
       <section className="settings-section">

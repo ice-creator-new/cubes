@@ -555,7 +555,9 @@ def test_a_consulted_member_running_out_of_its_turn_budget_does_not_end_the_run(
     asyncio.run(body())
 
 
-def test_create_group_resolves_names_reuses_a_match_and_kicks_off(make_backend, upstream) -> None:
+def test_create_group_resolves_names_reuses_a_match_and_posts_one_intro(
+    make_backend, upstream
+) -> None:
     backend = make_backend()
     state = {"direct": 0}
 
@@ -563,7 +565,7 @@ def test_create_group_resolves_names_reuses_a_match_and_kicks_off(make_backend, 
         request = requests[index - 1]
         joined = " ".join(str(m.get("content")) for m in request["messages"])
         if "建一个方案组" not in joined:
-            # The new group's opening and its members' answers.
+            # Nothing should ask the new group's members to introduce themselves.
             return {"content": "收到"}
         state["direct"] += 1
         if state["direct"] == 1:
@@ -617,15 +619,12 @@ def test_create_group_resolves_names_reuses_a_match_and_kicks_off(make_backend, 
             # Names and 「@名字」 resolve; the supervisor joins only because it was asked for.
             assert group["member_ids"] == [supervisor["id"], first["id"], second["id"]]
 
-            # The opening was posted as the supervisor and the members answered it.
+            # Only the creator's one-line opening stays: no member introduces itself.
             group_detail = await get_conversation(client, group["id"])
-            assert group_detail["messages"][0]["author_id"] == supervisor["id"]
-            assert group_detail["messages"][0]["content"] == "大家开工"
-            assert {m["author_id"] for m in agent_messages(group_detail)[1:]} == {
-                supervisor["id"],
-                first["id"],
-                second["id"],
-            }
+            assert [m["kind"] for m in group_detail["messages"]] == ["agent"]
+            opening = group_detail["messages"][0]
+            assert opening["author_id"] == supervisor["id"]
+            assert opening["content"] == "大家开工"
 
             results = {
                 key: value
@@ -639,5 +638,8 @@ def test_create_group_resolves_names_reuses_a_match_and_kicks_off(make_backend, 
             assert results["g1"]["existing"] is False
             assert results["g2"]["existing"] is True
             assert results["g2"]["conversation_id"] == group["id"]
+
+        # The direct run answered twice about the group; no member intro turn was served.
+        assert upstream.request_count == 4
 
     asyncio.run(body())

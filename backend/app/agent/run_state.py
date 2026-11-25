@@ -52,6 +52,10 @@ _TURN: ContextVar["TurnBudget | None"] = ContextVar("cubes_turn_budget", default
 # The group task the current bot turn is working on; a context variable for the same reason:
 # side-by-side opinions each work on their own task.
 GROUP_TASK: ContextVar[str | None] = ContextVar("cubes_group_task", default=None)
+# The activity the current bot turn is writing (see ``app.store.activities``). Nested turns —
+# an ``ask_agent`` answer, a private chat opened by ``direct_message`` — read the outer value,
+# which is exactly the ``parent_id`` of the turn they open.
+ACTIVITY: ContextVar[str | None] = ContextVar("cubes_activity", default=None)
 
 
 @dataclass
@@ -70,6 +74,10 @@ class QueuedAgent:
     task_id: str | None = None
     # What the previous owner said when it transferred the task here.
     note: str = ""
+    # This turn's slice of a multi-ask user message (already a prompt line), when it has one.
+    focus: str = ""
+    # An invite slot: the turn runs only once these agents are in the group.
+    needs: tuple[str, ...] = ()
 
 
 @dataclass
@@ -184,6 +192,10 @@ class ActiveRun:
     upstream_error: bool = False
     # Who stopped this run, for the tasks it leaves behind: 你, 群里的「X」, or a restart.
     stopped_by: str = "你"
+    # The activity whose turn started this run (a task thread opened by ``start_task`` or
+    # ``group_assign``). Read when the run is started, so a queued thread still knows who
+    # caused it after the group turn has long finished.
+    activity_parent: str | None = None
 
     def take_steers(self) -> list[dict]:
         """Hand over every steer waiting now, so each reaches the model exactly once."""
@@ -245,6 +257,11 @@ class RunLauncher:
             pending_agent_ids=[],
             finished_at=now_iso(),
         )
+        # No turn owns this run any more, so its open activities close here or never.
+        for activity in self._store.activities_of_run(run_id, unfinished=True):
+            self._store.finish_activity(
+                str(activity["id"]), status="stopped", summary="已停下：任务已停止。"
+            )
 
     async def _heal(self, conversation_id: str) -> dict | None:
         """Make the engine and the database agree on this chat's run; answer the live row.

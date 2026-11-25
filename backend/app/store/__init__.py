@@ -14,6 +14,7 @@ aggregate, all of them over the single connection :class:`~app.store.db.Database
 from __future__ import annotations
 
 from .actions import Actions
+from .activities import Activities
 from .agents import Agents
 from .approval_rules import ApprovalRules
 from .attachments import Attachments
@@ -79,6 +80,7 @@ class Store(
     Webhooks,
     CliSessions,
     GroupTasks,
+    Activities,
     WorkingFiles,
 ):
     """Small synchronous SQLite store.

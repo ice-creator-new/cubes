@@ -223,17 +223,34 @@ export interface Action {
   detail?: ActionDetail | null;
 }
 
+/** One ask inside a user message that carried several, and who takes it. */
+export interface RouteIntent {
+  /** The slice of the user's words this ask is. */
+  text: string;
+  kind: "answer" | "steer" | "resume" | "status" | "invite";
+  /** Who takes this slice, in order. */
+  speakers: string[];
+  /** The live task a `steer` or `resume` points at. */
+  task_id?: string | null;
+  /** Team agents outside the group this slice brings in. */
+  invite: string[];
+}
+
 /** What the group's invisible dispatcher decided about one user message. */
 export interface RouteDecision {
   /** Ordered agent ids for `answer`; empty for the other kinds. */
   speakers: string[];
-  kind: "answer" | "steer" | "resume" | "status" | "none";
+  kind: "answer" | "steer" | "resume" | "status" | "invite" | "none";
   /** The live task a `steer` or `resume` points at. */
   task_id?: string | null;
   /** One short Chinese sentence, the hint's tooltip. */
   reason: string;
   /** Who decided: the dispatcher, the fallback rule, an explicit @, or the user's own reroute. */
   by: "dispatcher" | "fallback" | "mention" | "user";
+  /** Still deciding: the hint reads 「正在决定谁来接」 and no speakers are known yet. */
+  pending?: boolean;
+  /** Present only when the message carried several asks, in the order they were written. */
+  intents?: RouteIntent[];
 }
 
 /** One task's row in a `kind: "status"` progress card. */
@@ -300,6 +317,18 @@ export interface Message {
   route?: RouteDecision | null;
   /** On a `kind: "status"` row: the progress the card draws, straight from task data. */
   status_card?: StatusCard | null;
+  /** On a notice row: the outsider a member @-ed, and the offer to pull them in. */
+  invite?: MessageInvite | null;
+  /** On an agent or action row written during a bot's activity: that activity's id. */
+  activity_id?: string | null;
+}
+
+/** A 「拉进群」 offer on a notice row, for a team agent a bot @-ed outside this group. */
+export interface MessageInvite {
+  agent_id: string;
+  name: string;
+  /** The bot message whose @ asked for them. */
+  message_id: string | null;
 }
 
 /** One emoji folded to its pill: the count of actors, whether the user is among them, and who. */
@@ -377,6 +406,99 @@ export interface Run {
   hops: number;
   /** The schedule that started this run; null for a run the user started. */
   schedule_id?: string | null;
+}
+
+/** How one bot's piece of work in one conversation ended, or that it is still going. */
+export type ActivityStatus = "running" | "awaiting" | "completed" | "stopped" | "error" | "limited";
+
+/**
+ * One bot's turn as a unit: from the moment it starts answering until it writes its final
+ * answer, stops or fails. In a group the chat shows one card per live activity and only the
+ * answer once it is done; every step lives in the activity's detail.
+ */
+export interface Activity {
+  id: string;
+  conversation_id: string;
+  agent_id: string;
+  agent_name: string;
+  run_id: string;
+  /** Set when the activity runs inside a task thread. */
+  task_id: string | null;
+  /** The activity that caused this one (a consult, a task, a hand-off). */
+  parent_id: string | null;
+  /** Short enough for a card's title line; renamed once from the request. */
+  title: string;
+  /** One line of conclusion; "" while it runs, 「已停下：…」 when it stopped. */
+  summary: string;
+  status: ActivityStatus;
+  /** What it is doing right now; "" when finished. */
+  current_step: string;
+  /** Its last streamed sentence, for a quiet line under the card. */
+  latest_text: string;
+  /** Tool calls plus notes so far. */
+  steps: number;
+  /** The newest call's tool, "" before the first; the card draws the icon its row does. */
+  current_tool: string;
+  started_at: string;
+  finished_at: string | null;
+  /** The message this activity answers. */
+  request_message_id: string | null;
+  /** Its final answer bubble; null while running or when it wrote none. */
+  answer_message_id: string | null;
+}
+
+/** What one row of an activity's step list is. */
+export type ActivityStepKind = "tool" | "note" | "ask" | "handoff";
+
+export type ActivityStepStatus = "running" | "completed" | "error" | "awaiting" | "denied";
+
+/** One step as the detail sheet lists it. */
+export interface ActivityStep {
+  id: string;
+  kind: ActivityStepKind;
+  /** Already short, e.g. 「搜索「iOS 26 装机率」」. */
+  title: string;
+  /** A result excerpt, or "" when there is nothing worth a second line. */
+  subtitle: string;
+  status: ActivityStepStatus;
+  message_id: string;
+  action_id: string | null;
+  /** A hand-off: the section this step leads to. */
+  target_activity_id: string | null;
+  created_at: string;
+}
+
+/** One activity's steps: the activity itself, then each delegated activity under it. */
+export interface ActivitySection {
+  id: string;
+  /** 「主线」 on the activity's own section, the bot's name on a child's. */
+  label: string;
+  agent_id: string;
+  activity_id: string;
+  /** The turn's own rows, oldest first, the same payload the conversation returns. */
+  messages: Message[];
+  steps: ActivityStep[];
+}
+
+/** Everything `GET /activities/{id}` answers. */
+export interface ActivityDetail {
+  activity: Activity;
+  conversation_title: string;
+  answer: Message | null;
+  sections: ActivitySection[];
+}
+
+/** One page of `GET /agents/{id}/activities`, newest first. */
+export interface ActivitiesPage {
+  activities: Activity[];
+  has_more: boolean;
+}
+
+/** How the group dispatcher has fared lately, shown next to its model pick. */
+export interface DispatchHealth {
+  failures_24h: number;
+  last_error: "TimeoutError" | "UpstreamError" | "Unreadable" | null;
+  last_at: string | null;
 }
 
 /** One remembered 「总是允许」: a tool and the one bot it covers, or every bot. */
@@ -1046,6 +1168,8 @@ export interface TeamSettings {
   digest: DigestSettings;
   /** The group dispatcher's model pick; null means automatic (the fastest configured one). */
   dispatch_model: ModelRef | null;
+  /** How the dispatcher has fared in the last day; absent on older servers. */
+  dispatch_health?: DispatchHealth;
 }
 
 /** Which connector tools a member may call: everything, read-only, or none at all. */

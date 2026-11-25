@@ -26,6 +26,7 @@ from .config import Settings, load_settings
 from .engine import SupervisorEngine
 from .routes import (
     actions,
+    activities,
     agents,
     approval_rules,
     attachments,
@@ -147,6 +148,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         workbench,
         memories,
         agents,
+        activities,
         providers,
         connectors,
         computer,

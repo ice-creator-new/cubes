@@ -27,3 +27,10 @@ export function momentStamp(iso: string, now = new Date()): string {
   const date = value.getFullYear() === now.getFullYear() ? day.format(value) : full.format(value);
   return `${date} ${time.format(value)}`;
 }
+
+/** Just the clock: rows already sit under a day header that says which day it was. */
+export function clockTime(iso: string): string {
+  const value = new Date(iso);
+  if (Number.isNaN(value.getTime())) return "";
+  return time.format(value);
+}

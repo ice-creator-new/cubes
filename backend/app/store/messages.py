@@ -34,6 +34,8 @@ class Messages:
         task_id: str | None = None,
         status_card: dict | None = None,
         addresses: list[str] | None = None,
+        activity_id: str | None = None,
+        invite: dict | None = None,
     ) -> dict:
         message_id = new_id("m")
         with self._transaction() as tx:
@@ -59,6 +61,8 @@ class Messages:
                 task_id=task_id,
                 status_card=status_card,
                 addresses=addresses,
+                activity_id=activity_id,
+                invite=invite,
             )
             self._bind_attachments(tx, message_id, attachment_ids or [])
             self._touch(tx, conversation_id)
@@ -92,6 +96,8 @@ class Messages:
         task_id: str | None = None,
         status_card: dict | None = None,
         addresses: list[str] | None = None,
+        activity_id: str | None = None,
+        invite: dict | None = None,
     ) -> None:
         if seq is None:
             seq = conn.execute(
@@ -109,8 +115,8 @@ class Messages:
                  action_id, mentions, reply_to_id, relay_conversation_id, relay_direction,
                  relay_peer_id, relay_peer_name, origin_message_id, interrupts, schedule_id,
                  schedule_title, mood, seq, created_at, run_id, reminder, task_id,
-                 status_card, addresses)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 status_card, addresses, activity_id, invite)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 message_id,
@@ -140,6 +146,8 @@ class Messages:
                 task_id,
                 None if status_card is None else json.dumps(status_card, ensure_ascii=False),
                 json.dumps(addresses or [], ensure_ascii=False),
+                activity_id,
+                None if invite is None else json.dumps(invite, ensure_ascii=False),
             ),
         )
     def get_message(self, message_id: str) -> dict | None:
@@ -156,6 +164,19 @@ class Messages:
                 (conversation_id,),
             ).fetchone()
         return int(row["newest"])
+
+    def activity_messages(self, activity_id: str) -> list[dict]:
+        """Every row one turn wrote, oldest first: its narration and its tool calls."""
+        conn = self._ensure()
+        with self._lock:
+            rows = conn.execute(
+                """
+                SELECT * FROM messages WHERE activity_id = ?
+                 ORDER BY seq ASC, rowid ASC
+                """,
+                (activity_id,),
+            ).fetchall()
+        return [self._message_row(row) for row in rows]
 
     def list_messages(self, conversation_id: str) -> list[dict]:
         conn = self._ensure()
@@ -247,6 +268,18 @@ class Messages:
             cursor = conn.execute(
                 "UPDATE messages SET route = ? WHERE id = ?",
                 (None if route is None else json.dumps(route, ensure_ascii=False), message_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_message(message_id)
+
+    def set_message_invite(self, message_id: str, invite: dict | None) -> dict | None:
+        """Clear (or replace) a notice's 「拉进群」 offer once it is answered."""
+        conn = self._ensure()
+        with self._lock:
+            cursor = conn.execute(
+                "UPDATE messages SET invite = ? WHERE id = ?",
+                (None if invite is None else json.dumps(invite, ensure_ascii=False), message_id),
             )
             if cursor.rowcount == 0:
                 return None
@@ -466,9 +499,11 @@ class Messages:
             "run_id": row["run_id"],
             "reminder": bool(row["reminder"]),
             "task_id": row["task_id"],
+            "activity_id": row["activity_id"],
             "route": json.loads(row["route"]) if row["route"] else None,
             "addresses": json.loads(row["addresses"] or "[]"),
             "status_card": json.loads(row["status_card"]) if row["status_card"] else None,
+            "invite": json.loads(row["invite"]) if row["invite"] else None,
             "leads_to_tools": (
                 None if row["leads_to_tools"] is None else bool(row["leads_to_tools"])
             ),

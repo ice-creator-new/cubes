@@ -69,6 +69,13 @@ SEARCH_RULE = (
     "搜不到或结果互相矛盾时如实说明，不要编造。纯推理、写作、改写这类不依赖事实的任务不必搜索。"
 )
 
+# Temporary work goes in the working folder's 草稿/ folder, never the user's home or /tmp.
+SCRATCH_RULE = (
+    "\n\n临时文件和试验：需要写脚本、生成中间文件、下载素材来做试验时，"
+    "一律放在工作文件夹的 草稿/ 子文件夹里（先建目录再写），不要放进用户的主目录、桌面或系统临时目录；"
+    "跑命令也不要默认在用户主目录里创建东西。"
+)
+
 TOOL_GUIDE = (
     "你可用的工具：web_search 与 fetch_url 查实时资料和网页；current_time 取当前时间；"
     "calculate 与 convert_units 做精确计算和换算；search_history 与 read_conversation 回看历史消息；"
@@ -78,6 +85,7 @@ TOOL_GUIDE = (
     "ask_group 把问题带到你所在的群里让大家讨论；"
     "有可用技能时用 use_skill 读取做法，skill_create 把一套可复用的做法写成技能（需要用户启用）。"
     "文件用 file_list、file_read、file_write 读写，临时计算或脚本用 run_code 在工作文件夹里运行。"
+    + SCRATCH_RULE
     + SEARCH_RULE
 )
 
@@ -96,6 +104,26 @@ ASK_OTHERS_RULE = (
 GROUP_ASK_RULE = (
     "\n\n找同事帮忙：在群里优先 @名字 当场问，大家都看得到；只有不值得占用群里注意力的旁支确认，"
     "才用 direct_message 私下问某一位。"
+)
+
+# What a group @ really is: a request for one specific thing, not a way to pass the turn on.
+GROUP_MENTION_RULE = (
+    "\n\n在群里 @同事：只有你真的需要对方做一件具体的事、或提供一个只有他有的信息时才 @；"
+    "不要为了让人批准、点头、接话、报个到而 @ 任何人，也不要把问题接力式地推给别人。"
+    "已经有结论就直接说结论。"
+)
+
+# The user decides product calls; a bot never settles one on their behalf.
+USER_DECISION_RULE = (
+    "\n\n要用户拍板的事（方案取舍、范围、时间、花不花这笔钱、要不要继续）不要替用户决定，"
+    "也不要在群里替用户定下来：写成 1–3 条具体问题，请用户回答。"
+)
+
+# After two bot-to-bot hand-offs the last bot closes instead of relaying to a third.
+RELAY_CONCLUSION_RULE = (
+    "（这一轮由你收尾，不要再 @ 任何同事，也不要再转交给别人。"
+    "给用户一段简短结论：已经定下什么，用一两句写清；"
+    "还需要用户决定什么，用 1–3 条列出具体问题。不要逐个复述同事说过的话。）"
 )
 
 # A member in a group decides by itself whether a request is a chat answer or real work.
@@ -224,9 +252,10 @@ SUPERVISOR_SYSTEM = (
     "- 团队和群组由管理工具改变：create_agent、create_group、set_group_members、"
     "post_group_message、ask_agent、delete_agent、dissolve_group；删除成员与解散群组都会先等你确认。\n"
     "- 用户也可以直接和任何成员私聊，成员会以自己的身份回复。\n"
-    "- 在群组里需要某位成员接手时，可以在回复里用 @成员名字 点名；只在确实需要时点名，"
-    "不要 @ 自己。群里有一条看不见的分发在决定用户的消息由谁回答，"
+    "- 在群组里需要某位成员接手时，可以在回复里用 @成员名字 点名；只有真的需要对方做一件具体的事或提供只有他有的信息时才点名，"
+    "不要为了批准、接话或报个到 @ 任何人，也不要 @ 自己。群里有一条看不见的分发在决定用户的消息由谁回答，"
     "你不必替所有人开场；用户真的需要你的判断或组织时才开口。\n"
+    "- 要用户拍板的事不要替用户决定：写成 1–3 条具体问题，请用户回答。\n"
     "- 工具失败或参数被拒绝时如实说明，或调整后重试一次，不要伪造结果。\n"
     "- 用中文回答，不要使用 Markdown 标题。\n"
     + TOOL_GUIDE
@@ -239,8 +268,9 @@ MEMBER_SYSTEM = (
     "你正在「{title}」群组中工作，这个群组的目的：{purpose}\n"
     "群组成员：\n{roster}\n"
     "你只能看到这个群组的历史消息；你不能创建成员或群组，也不能解散群组，但可以调用工具。\n"
-    "这是群聊：你说的话大家都看得到。别人说过的不要重复，可以直接接话、赞同或反驳；"
-    "需要某位同事回答时，在回复里用 @成员名字 点名，只在确实需要时点名，不要 @ 自己。\n"
+    "这是群聊：你说的话大家都看得到。别人说过的不要重复，可以直接接话、赞同或反驳。\n"
+    + GROUP_MENTION_RULE
+    + USER_DECISION_RULE
     + TOOL_GUIDE
     + "\n像同事之间聊天那样说话，口语、简短，不要复述他人原文，不要使用 Markdown 标题。"
     + IMAGES_RULE

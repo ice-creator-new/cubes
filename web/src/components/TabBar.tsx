@@ -79,6 +79,13 @@ function describe(
     const group = workspace?.conversations.find((c) => c.id === tab.id);
     return { title: group ? `${group.title} · 设置` : "群组设置", members: group ? membersOf(workspace, group) : [] };
   }
+  if (tab.kind === "activities") {
+    const agent = agentByID(workspace, tab.id);
+    return agent ? { title: `${agent.name} · 工作记录`, agent } : { title: "工作记录", icon: "history" };
+  }
+  if (tab.kind === "activity") {
+    return { title: tab.title ?? "工作记录", icon: "history" };
+  }
   if (tab.kind === "run") {
     // Several runs can be open at once: each names where it ran on top (the chat and its face,
     // or the scheduled task, whose hidden workspace is in no list) and when it started

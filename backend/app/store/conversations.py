@@ -13,6 +13,9 @@ from ..errors import GROUP_BUSY, GroupDissolveRefused, NOT_A_GROUP
 from ..sidebar import FolderNameTaken, folder_name_key, shape_layout
 from .db import _UNSET, new_id, now_iso
 
+# ``meta`` key prefix: the bot whose turn a stop cut short, per conversation.
+INTERRUPTED_AGENT_PREFIX = "interrupted_agent:"
+
 class Conversations:
     """Conversations, members and the sidebar."""
 
@@ -633,6 +636,19 @@ class Conversations:
             if folder_name_key(str(row["name"])) == wanted:
                 return True
         return False
+    # ------------------------------------------------------------------ interrupted turn
+    def set_interrupted_agent(self, conversation_id: str, agent_id: str) -> None:
+        """Remember whose work a stop cut short: a later 「继续」 goes back to that bot."""
+        with self._transaction() as tx:
+            self._meta_set(tx, INTERRUPTED_AGENT_PREFIX + conversation_id, agent_id)
+    def interrupted_agent(self, conversation_id: str) -> str | None:
+        conn = self._ensure()
+        with self._lock:
+            raw = self._meta(conn, INTERRUPTED_AGENT_PREFIX + conversation_id)
+        return (raw or "").strip() or None
+    def clear_interrupted_agent(self, conversation_id: str) -> None:
+        with self._transaction() as tx:
+            self._meta_delete(tx, INTERRUPTED_AGENT_PREFIX + conversation_id)
     def _conversation_row(self, row: sqlite3.Row) -> dict:
         return {
             "id": row["id"],

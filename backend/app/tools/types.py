@@ -127,8 +127,6 @@ class ToolRunContext:
     assign_part: Callable[..., Awaitable[tuple[str, dict | None, dict]]] | None = None
     # ``start_task``: turn the caller's group turn into a hidden task thread and run it there.
     start_task: Callable[..., Awaitable[dict]] | None = None
-    # ``create_group``: start the new group's members on the supervisor's opening message.
-    kick_off: Callable[[dict, dict], None] | None = None
     review_member: Callable[..., Awaitable[tuple[str, dict, dict]]] | None = None
     origin_message_id: Callable[[], str | None] | None = None
     # The message a write is made against: the reply being composed, else the trigger.

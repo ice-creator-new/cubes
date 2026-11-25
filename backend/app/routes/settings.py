@@ -58,7 +58,11 @@ async def patch_permission_settings(
 
 def team_state(store: Store, settings) -> dict:
     """The stored switches plus every step preset's resolved numbers, read-only."""
-    return {**store.team_settings(), "step_budgets": step_budget_rules.all_presets(settings)}
+    return {
+        **store.team_settings(),
+        "step_budgets": step_budget_rules.all_presets(settings),
+        "dispatch_health": store.dispatch_health(),
+    }
 
 
 @router.get("/settings/team")
