@@ -301,12 +301,14 @@ function enableAcrylic() {
   }
 }
 
-/** Windows: the caption buttons overlay the tab strip (there is no system title bar), tinted to
- *  match the strip's own band: --rail in styles.css, --ink for the glyphs. */
+/** Windows: the caption buttons overlay the tab strip (there is no system title bar) over the
+ *  acrylic backdrop — no background of their own, just the glyphs. */
 function titleBarOverlay() {
-  return nativeTheme.shouldUseDarkColors
-    ? { color: "#1c1d22", symbolColor: "#ececf1", height: 40 }
-    : { color: "#ecebe8", symbolColor: "#1e1f22", height: 40 };
+  return {
+    color: "#00000000",
+    symbolColor: nativeTheme.shouldUseDarkColors ? "#ececf1" : "#1e1f22",
+    height: 40,
+  };
 }
 
 /** Keep the overlay tint in step with the app theme, and with the system one when following it. */

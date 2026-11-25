@@ -635,6 +635,17 @@ kbd {
   margin-left: 0;
 }
 
+/* Windows: no traffic lights clear the head's left, so the collapse toggle centers over the
+   faces instead of sitting right with a mac-shaped gap beside it. */
+:root[data-shell="desktop"] .sidebar.collapsed .sidebar-head {
+  justify-content: center;
+  padding: 0;
+}
+
+:root[data-shell="desktop"] .sidebar.collapsed .sidebar-head .icon-button {
+  margin-left: 0;
+}
+
 /* macOS fullscreen: no traffic lights, so nothing reserves their room. The title rows shrink to a
    compact strip, the search moves up into the rail's title row (one copy of the field shows at a
    time) and the folded rail's toggle takes the lights' place; the chat and the list rise with
