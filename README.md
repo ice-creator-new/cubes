@@ -212,3 +212,7 @@ npm run dev
 - 「本机」直接操作后端所在的电脑。桌面版就是这台 Mac，第一次使用会先问你允许；截图、命令输出和网页内容会存进本地数据库，并发给当前模型服务。
 
 完整说明见 [docs/security.md](docs/security.md)。
+
+## 开源协议
+
+[MIT License](LICENSE) © 2026 SunFlyIce。随便用、随便改、可以商用，保留版权声明即可。

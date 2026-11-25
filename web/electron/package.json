@@ -5,6 +5,7 @@
   "version": "0.1.5",
   "description": "Cubes 桌面端：主管团队，在一个原生窗口里。",
   "author": "SunFlyIce",
+  "license": "MIT",
   "main": "main.cjs",
   "scripts": {
     "start": "sh scripts/start.sh",
