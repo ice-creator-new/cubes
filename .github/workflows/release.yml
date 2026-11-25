@@ -143,3 +143,7 @@ jobs:
             artifacts/*.dmg
             artifacts/*.exe
           generate_release_notes: true
+          body: |
+            ### 安装提示
+            - **macOS**：首次打开请 **右键 → 打开**（目前为 ad-hoc 签名，Gatekeeper 会拦截普通双击）
+            - **Windows**：安装向导可自选安装目录；后端服务在后台静默运行，不会弹出终端窗口

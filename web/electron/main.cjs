@@ -146,7 +146,7 @@ async function launchOnce(plan) {
   const child = spawn(
     plan.program,
     [...plan.leading, "--port", String(port), "--token", token, ...plan.trailing, "--parent-pid", String(process.pid)],
-    { cwd: plan.cwd, stdio: ["ignore", log, log] },
+    { cwd: plan.cwd, stdio: ["ignore", log, log], windowsHide: true },
   );
   fs.closeSync(log);
   backend = child;

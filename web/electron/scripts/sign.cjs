@@ -53,9 +53,15 @@ function ensureIdentity() {
 /** @param {{ appOutDir: string, packager: { appInfo: { productFilename: string, id: string } }, electronPlatformName: string }} context */
 exports.default = async function sign(context) {
   if (context.electronPlatformName !== "darwin") return;
-  // CI builds ship as-is: the local certificate only helps on the machine that made it.
-  if (process.env.CI) return;
   const appPath = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`);
+  // CI builds get an ad-hoc signature so Apple Silicon will run them at all; Gatekeeper still
+  // flags them as unverified (right-click → Open on first launch), which is expected until a
+  // Developer ID certificate exists.
+  if (process.env.CI) {
+    run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", appPath]);
+    console.log(`  • ad-hoc signed (CI)  ${appPath}`);
+    return;
+  }
   ensureIdentity();
   run("security", ["unlock-keychain", "-p", PASSWORD, KEYCHAIN]);
   // --deep signs the helpers, frameworks and the frozen backend inside too; the app itself keeps
