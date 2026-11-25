@@ -12,7 +12,7 @@
 // CUBES_GLASS=0 drops the sidebar material (vibrancy, frosted or Liquid Glass) and transparency,
 // to measure that on its own.
 
-const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, net, protocol, shell } = require("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain, nativeImage, nativeTheme, net, protocol, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -301,6 +301,50 @@ function enableAcrylic() {
   }
 }
 
+// --------------------------------------------------------------------------- app icon
+
+// The dock/taskbar picture. Two bundled variants (icon.png / icon-dark.png) can follow the system
+// appearance, or hold one of them, or use a picture the user picked themselves. The choice lives
+// in icon.json beside the data; a custom picture is copied into the data folder as PNG.
+const ICON_DARK = path.join(__dirname, "build", "icon-dark.png");
+const ICON_PREF = path.join(DATA_DIR, "icon.json");
+const ICON_CUSTOM = path.join(DATA_DIR, "icon-custom.png");
+
+function readIconPref() {
+  try {
+    const mode = JSON.parse(fs.readFileSync(ICON_PREF, "utf8"))?.mode;
+    return mode === "light" || mode === "dark" || mode === "custom" ? mode : "auto";
+  } catch {
+    return "auto";
+  }
+}
+
+function saveIconPref(mode) {
+  const clean = mode === "light" || mode === "dark" || mode === "custom" ? mode : "auto";
+  try {
+    fs.writeFileSync(ICON_PREF, `${JSON.stringify({ mode: clean })}\n`);
+  } catch {
+    // A read-only data directory: the choice still holds for this launch.
+  }
+  applyAppIcon();
+  return clean;
+}
+
+/** Which picture this setting resolves to right now. */
+function iconImage(mode = readIconPref()) {
+  const variant = mode === "auto" ? (nativeTheme.shouldUseDarkColors ? "dark" : "light") : mode;
+  const file = variant === "custom" ? ICON_CUSTOM : variant === "dark" ? ICON_DARK : ICON;
+  const image = nativeImage.createFromPath(file);
+  return image.isEmpty() ? nativeImage.createFromPath(ICON) : image;
+}
+
+/** Dock on macOS, window/taskbar elsewhere. Safe to call before the window exists. */
+function applyAppIcon() {
+  const image = iconImage();
+  if (process.platform === "darwin") app.dock?.setIcon(image);
+  window?.setIcon(image);
+}
+
 /** Windows: the caption buttons overlay the tab strip (there is no system title bar) over the
  *  acrylic backdrop — no background of their own, just the glyphs. */
 function titleBarOverlay() {
@@ -320,7 +364,10 @@ function syncTitleBarOverlay() {
     /* an Electron without overlay updates: the first tint simply stands */
   }
 }
-nativeTheme.on("updated", syncTitleBarOverlay);
+nativeTheme.on("updated", () => {
+  syncTitleBarOverlay();
+  applyAppIcon();
+});
 
 handle("set-theme", (theme) => {
   nativeTheme.themeSource = theme === "light" || theme === "dark" ? theme : "system";
@@ -354,6 +401,27 @@ handle("set-glass", async (value) => {
 handle("glass-support", async () => {
   const native = await glassModule();
   return { liquid: Boolean(native) && liquidSupported(), frosted: true };
+});
+handle("app-icon-info", async () => ({ mode: readIconPref() }));
+handle("set-app-icon", async (mode) => ({ mode: saveIconPref(mode) }));
+handle("pick-app-icon", async () => {
+  if (!window) return null;
+  const result = await dialog.showOpenDialog(window, {
+    properties: ["openFile"],
+    filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp", "ico"] }],
+    message: "选择一张图片作为应用图标",
+    buttonLabel: "就用这张",
+  });
+  const file = result.canceled ? null : (result.filePaths[0] ?? null);
+  if (!file) return null;
+  const image = nativeImage.createFromPath(file);
+  if (image.isEmpty()) return null;
+  try {
+    fs.writeFileSync(ICON_CUSTOM, image.resize({ width: 1024, height: 1024, quality: "best" }).toPNG());
+  } catch {
+    return null;
+  }
+  return { mode: saveIconPref("custom") };
 });
 
 // ------------------------------------------------------------------------- glass
@@ -473,6 +541,7 @@ function createWindow() {
     },
   });
   enableAcrylic();
+  applyAppIcon();
   // The saved material goes on before the first frame, so a launch never flashes the default.
   window.once("ready-to-show", () => {
     void applyGlass().finally(() => window?.show());

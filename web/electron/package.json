@@ -2,7 +2,7 @@
   "name": "cubes",
   "productName": "Cubes",
   "private": true,
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Cubes 桌面端：主管团队，在一个原生窗口里。",
   "author": "SunFlyIce",
   "license": "MIT",
@@ -29,6 +29,7 @@
       "menu.cjs",
       "preload.cjs",
       "build/icon.png",
+      "build/icon-dark.png",
       "package.json"
     ],
     "extraResources": [

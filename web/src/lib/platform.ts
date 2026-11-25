@@ -15,6 +15,12 @@ export interface DesktopBridge {
   setGlass(glass: { kind: "liquid" | "frosted"; transparency: number; blur: number }): void;
   /** Which materials this Mac can draw: Liquid Glass needs macOS 26. */
   glassSupport(): Promise<{ liquid: boolean; frosted: boolean }>;
+  /** The dock/taskbar picture: follow the system appearance, or hold one variant, or a picked image. */
+  setAppIcon?(mode: AppIconMode): Promise<{ mode: AppIconMode } | null>;
+  /** Opens a picture picker and keeps the chosen image as the app icon. */
+  pickAppIcon?(): Promise<{ mode: AppIconMode } | null>;
+  /** The icon setting in effect. */
+  appIconInfo?(): Promise<{ mode: AppIconMode } | null>;
   openExternal(url: string): void;
   isFullscreen(): Promise<boolean>;
   /** Asks the shell for a folder; optional, so an older shell falls back to a text field. */
@@ -32,6 +38,10 @@ declare global {
 export const desktop: DesktopBridge | null = (typeof window !== "undefined" && window.cubesDesktop) || null;
 export const isDesktop = desktop !== null;
 export const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || navigator.userAgent);
+
+/** The app icon in the dock/taskbar: light and dark variants can follow the appearance, or hold
+ *  one of themselves, or be a picture the user picked. */
+export type AppIconMode = "auto" | "light" | "dark" | "custom";
 
 if (typeof document !== "undefined") {
   document.documentElement.dataset.shell = isDesktop ? (isMac ? "mac" : "desktop") : "web";

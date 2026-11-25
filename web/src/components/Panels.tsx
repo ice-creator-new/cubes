@@ -31,7 +31,7 @@ import { listTimestamp } from "../lib/time";
 import { SEND_MODES } from "../lib/sendMode";
 import { MODE_LABELS, PERMISSION_MODES, followModeLabel } from "../lib/permissions";
 import { PERIOD_LABELS, activityOf, budgetState, budgetTone, formatTokens, relativeTime, supervisorName } from "../lib/team";
-import { isDesktop } from "../lib/platform";
+import { desktop, isDesktop, type AppIconMode } from "../lib/platform";
 import { DEFAULT_GLASS, glassAvailable, glassSupport, MAX_BLUR, type Glass, type GlassSupport } from "../lib/glass";
 import type { RunRef } from "../lib/tabs";
 import { prefersReducedMotion, useFlip, usePresence, useSegmentedThumb } from "../lib/motion";
@@ -1914,6 +1914,26 @@ function GeneralSettings({
 }) {
   const segmented = useRef<HTMLDivElement>(null);
   const { thumb, ready } = useSegmentedThumb(segmented, appearance);
+  // The dock/taskbar picture lives in the shell, not the backend: read it once, save on tap.
+  const [iconMode, setIconMode] = useState<AppIconMode>("auto");
+  useEffect(() => {
+    let live = true;
+    void desktop?.appIconInfo?.().then((info) => {
+      if (live && info) setIconMode(info.mode);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+  const saveAppIcon = (value: AppIconMode) => {
+    setIconMode(value);
+    void desktop?.setAppIcon?.(value);
+  };
+  const pickAppIcon = () => {
+    void desktop?.pickAppIcon?.().then((info) => {
+      if (info) setIconMode(info.mode);
+    });
+  };
   return (
     <>
       <section className="settings-section">
@@ -1949,6 +1969,40 @@ function GeneralSettings({
           ))}
         </div>
       </section>
+
+      {isDesktop && (
+        <section className="settings-section">
+          <div className="settings-heading">
+            <h4>应用图标</h4>
+            <p>Dock 和任务栏上的那张脸。跟着明暗自动换，或者固定一张，也可以自己选图。</p>
+          </div>
+          <div className="segmented" role="radiogroup" aria-label="应用图标">
+            {(["auto", "light", "dark"] as const).map((value) => (
+              <button
+                key={value}
+                type="button"
+                role="radio"
+                data-seg={value}
+                aria-checked={iconMode === value}
+                className={iconMode === value ? "on" : ""}
+                onClick={() => saveAppIcon(value)}
+              >
+                {{ auto: "跟随系统", light: "浅色", dark: "深色" }[value]}
+              </button>
+            ))}
+            <button
+              type="button"
+              role="radio"
+              data-seg="custom"
+              aria-checked={iconMode === "custom"}
+              className={iconMode === "custom" ? "on" : ""}
+              onClick={pickAppIcon}
+            >
+              自定义…
+            </button>
+          </div>
+        </section>
+      )}
 
       <section className="settings-section">
         <div className="settings-heading">
