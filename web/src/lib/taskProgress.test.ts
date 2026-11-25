@@ -10,6 +10,7 @@ import {
   queuedWaitLine,
   isTaskArchived,
   isTaskDismissed,
+  showsStatusWord,
   taskCardActions,
   taskReasonLine,
   taskStatusMeta,
@@ -217,6 +218,23 @@ describe("queued wait sentence", () => {
   it("stays generic when the task list is not loaded", () => {
     expect(queuedWaitLine(task("q", { status: "queued" }), undefined, "匠师")).toBe("等前面的任务做完再开始");
   });
+
+  it("keeps the scheduler's own reason when it queued behind a live lane", () => {
+    const queued = task("q", { status: "queued", current_step: "排队中，等「匠师」做完" });
+    expect(queuedWaitLine(queued, [queued], "匠师")).toBe("排队中，等「匠师」做完");
+  });
+});
+
+describe("queued card status word", () => {
+  it("drops the top-right word when the wait line already says 排队中", () => {
+    expect(showsStatusWord("queued", "排队中，等这一轮回复结束")).toBe(false);
+    expect(showsStatusWord("queued", "排队中，等「主管」做完")).toBe(false);
+  });
+
+  it("keeps it when the card waits on the cap, and on every other status", () => {
+    expect(showsStatusWord("queued", "同时在做的任务满了，空出来就开始")).toBe(true);
+    expect(showsStatusWord("running", "排队中，等前面的任务做完")).toBe(true);
+  });
 });
 
 describe("task card buttons", () => {
@@ -227,6 +245,11 @@ describe("task card buttons", () => {
     expect(taskCardActions("stopped")).toEqual(["resume", "dismiss", "thread"]);
     expect(taskCardActions("failed")).toEqual(["resume", "dismiss", "thread"]);
     expect(taskCardActions("done")).toEqual(["thread"]);
+  });
+
+  it("lets a queued card in the user's own chat start right away", () => {
+    expect(taskCardActions("queued", true)).toEqual(["start", "cancel"]);
+    expect(taskCardActions("running", true)).toEqual(["expand", "thread", "stop"]);
   });
 });
 

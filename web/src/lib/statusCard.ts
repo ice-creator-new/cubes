@@ -1,7 +1,7 @@
 // The dispatcher's progress card, read as rows: owner, what it is, how far it got, and its newest
 // line. Pure so the card's wording is testable without a chat or a backend.
 
-import type { StatusCard, StatusCardTask } from "../api/types";
+import type { ActivityTodo, StatusCard, StatusCardTask } from "../api/types";
 import { taskStatusMeta } from "./taskProgress";
 
 export interface StatusCardRow {
@@ -19,7 +19,21 @@ export interface StatusCardRow {
   waitingFor: string;
 }
 
+/** One live work lane: who, what, and the board it is working through. */
+export interface StatusCardActivityRow {
+  key: string;
+  ownerID: string | null;
+  ownerName: string;
+  title: string;
+  /** The lane's own board, oldest first; [] when it keeps none. */
+  todos: ActivityTodo[];
+  /** What it is doing right now, without the bot's own name in front. */
+  current: string;
+}
+
 export interface StatusCardView {
+  /** Work running in the group right now, before the task threads. */
+  live: StatusCardActivityRow[];
   rows: StatusCardRow[];
   idleNames: string[];
 }
@@ -31,6 +45,8 @@ export interface StatusCardView {
 export function statusCardRows(
   card: StatusCard,
   nameOf: (id: string) => string | undefined,
+  /** A live lane names its bot; this finds the id so the card can draw its face. */
+  idOf?: (name: string) => string | undefined,
 ): StatusCardView {
   const rows = card.tasks.map((task, index) => {
     const resolved = nameOf(task.owner);
@@ -47,7 +63,22 @@ export function statusCardRows(
       waitingFor: (task.waiting_for ?? "").trim(),
     };
   });
+  const live = (card.activities ?? []).map((activity, index) => {
+    const resolved = idOf?.(activity.agent);
+    return {
+      key: `${activity.activity_id}-${index}`,
+      ownerID: resolved ?? null,
+      ownerName: activity.agent,
+      title: activity.title,
+      todos: activity.todos,
+      current: activity.current_step
+        .trim()
+        .replace(/^「[^」]*」/, "")
+        .replace(/（\d+ 秒）$/, ""),
+    };
+  });
   return {
+    live,
     rows,
     idleNames: card.idle.map((who) => nameOf(who) ?? who).filter((name) => name !== ""),
   };

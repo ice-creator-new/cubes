@@ -1,44 +1,51 @@
-// Sending while a reply runs: which mode reaches the server, and how the composer explains it.
-// The choice is a setting — the bot's own pick, else the team's — not something to pick at send
-// time. A CLI bot drives its own session, and images cannot join a request already on the wire,
-// so both fall back to a queue.
+// Sending while a reply runs: which mode reaches the server, and how the composer says what a
+// send will do. The choice is a setting — the bot's own pick, else the team's — not something to
+// pick at send time. A send never interrupts by default: it opens a lane of its own.
 
-import type { Message, SendMode } from "../api/types";
+import type { Message, Run, RunLane, SendMode } from "../api/types";
 
 export const SEND_MODES: { id: SendMode; label: string; hint: string }[] = [
   {
-    id: "steer",
-    label: "插进这一轮",
-    hint: "消息会加入正在进行的这一轮，机器人在下一次思考时看到并调整，不打断它。",
+    id: "parallel",
+    label: "并行（不打断）",
+    hint: "新消息另开一路马上回答，正在做的事不停；回答会先读那一路的进度，不会重复也不会抢着做。",
   },
   {
     id: "queue",
-    label: "做完再发",
+    label: "排队",
     hint: "先排队，等这一轮结束后再作为新消息发送；发送前可以撤回。",
   },
   {
     id: "interrupt",
-    label: "停止并发送",
+    label: "停下再发",
     hint: "停下正在写的回复，立刻回答这条新消息。",
   },
 ];
 
 /** What the server is actually asked to do for a send that meets a running reply. */
-export function resolveSendMode(
-  agentMode: SendMode | null | undefined,
-  teamMode: SendMode,
-  cliBot: boolean,
-  withAttachments = false,
-): SendMode {
-  const mode = agentMode ?? teamMode;
-  return mode === "steer" && (cliBot || withAttachments) ? "queue" : mode;
+export function resolveSendMode(agentMode: SendMode | null | undefined, teamMode: SendMode): SendMode {
+  return agentMode ?? teamMode;
 }
 
-/** The empty field's prompt while a reply runs. */
-export function busyPlaceholder(mode: SendMode): string {
-  if (mode === "steer") return "发送会加入当前这一轮";
-  if (mode === "queue") return "发送会排队，等这一轮结束";
-  return "发送会打断当前回复";
+/** How a lane reads in a menu: the work it does, in the user's words. */
+export function laneLabel(lane: RunLane): string {
+  return lane === "reply" ? "回答" : "干活";
+}
+
+/** One entry of the stop menu: which lane stops, or every lane at once. */
+export interface StopChoice {
+  /** The run to stop; empty for the whole conversation. */
+  id: string;
+  label: string;
+}
+
+/**
+ * The stop button's menu. One lane stops directly, so the menu is only built when there are
+ * several; the last entry always stops them all.
+ */
+export function stopChoices(runs: Run[], nameOf: (run: Run) => string): StopChoice[] {
+  const choices = runs.map((run) => ({ id: run.id, label: `停下 ${nameOf(run)}（${laneLabel(run.lane)}）` }));
+  return runs.length > 1 ? [...choices, { id: "", label: "全部停下" }] : choices;
 }
 
 /** Sends still waiting for their turn: shown above the composer, never in the transcript. */

@@ -39,19 +39,35 @@ class ContextWindow:
         is simply rebuilt from the stored rows — there is one way to build a request.
         """
         messages = build()
-        self._mark_steers(active, conversation)
+        self._add_lane_note(active, conversation, author, messages)
         if await self._compact(active, conversation, author, messages, tools=tools):
             messages = build()
-            self._mark_steers(active, conversation)
+            self._add_lane_note(active, conversation, author, messages)
         return messages
 
-    def _mark_steers(self, active: ActiveRun, conversation: dict) -> None:
-        """A request built from the stored rows already contains every steer saved before it.
-
-        Clearing them here — synchronously after the build — keeps the loop from handing the
-        same message over again, while a steer saved later still reaches the next call.
-        """
-        active.keep_steers_after(self._store.newest_message_seq(conversation["id"]))
+    def _add_lane_note(
+        self,
+        active: ActiveRun,
+        conversation: dict,
+        author: dict,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Tell a turn what its lane owes: a to-do board, or its group's real progress."""
+        note = self._lane_system_note(active, conversation, author)
+        if not note:
+            return
+        # The note belongs to this request only; it is never written to the transcript.
+        # It rides in the system prompt so every protocol sees one system turn, and it goes
+        # before the mood rule: that rule must stay the prompt's final instruction.
+        if messages and messages[0].get("role") == "system":
+            system = str(messages[0]["content"])
+            if prompts.MOOD_RULE in system:
+                system = system.replace(prompts.MOOD_RULE, f"{note}\n\n{prompts.MOOD_RULE}", 1)
+            else:
+                system = f"{system}\n\n{note}"
+            messages[0]["content"] = system
+        else:
+            messages.insert(0, {"role": "system", "content": note})
 
     def _guard(
         self,

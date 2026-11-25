@@ -337,11 +337,148 @@ class Activities:
             ).fetchone()
         return "" if row is None else str(row["tool_name"] or "")
 
+    # ------------------------------------------------------------------ board
+
+    def replace_activity_todos(self, activity_id: str, items: Sequence[dict]) -> list[dict]:
+        """Replace an activity's whole to-do list, in the order given."""
+        timestamp = now_iso()
+        with self._transaction() as tx:
+            tx.execute("DELETE FROM activity_todos WHERE activity_id = ?", (activity_id,))
+            for index, item in enumerate(items):
+                tx.execute(
+                    "INSERT INTO activity_todos (activity_id, idx, text, status, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        activity_id,
+                        index,
+                        str(item["text"]),
+                        str(item["status"]),
+                        timestamp,
+                    ),
+                )
+        return self.list_activity_todos(activity_id)
+
+    def list_activity_todos(self, activity_id: str) -> list[dict]:
+        conn = self._ensure()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT text, status FROM activity_todos WHERE activity_id = ? ORDER BY idx",
+                (activity_id,),
+            ).fetchall()
+        return [{"text": row["text"], "status": row["status"]} for row in rows]
+
+    def add_activity_note(
+        self,
+        activity_id: str,
+        *,
+        kind: str,
+        text: str,
+        source_message_id: str | None = None,
+    ) -> dict:
+        note_id = new_id("an")
+        timestamp = now_iso()
+        with self._transaction() as tx:
+            tx.execute(
+                "INSERT INTO activity_notes "
+                "(id, activity_id, kind, text, source_message_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (note_id, activity_id, kind, text, source_message_id, timestamp),
+            )
+        conn = self._ensure()
+        with self._lock:
+            row = conn.execute(
+                "SELECT * FROM activity_notes WHERE id = ?", (note_id,)
+            ).fetchone()
+        return _row(row) if row is not None else {}
+
+    def list_activity_notes(self, activity_id: str) -> list[dict]:
+        conn = self._ensure()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT kind, text, source_message_id, created_at FROM activity_notes "
+                "WHERE activity_id = ? ORDER BY created_at, rowid",
+                (activity_id,),
+            ).fetchall()
+        return [
+            {
+                "kind": row["kind"],
+                "text": row["text"],
+                "source_message_id": row["source_message_id"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def live_activities(self, conversation_id: str) -> list[dict]:
+        """Every turn still open in one conversation, oldest first (work and reply lanes)."""
+        conn = self._ensure()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM activities WHERE conversation_id = ? "
+                "AND status IN ('running', 'awaiting') ORDER BY started_at",
+                (conversation_id,),
+            ).fetchall()
+        return [_row(row) for row in rows]
+
+    def last_work_activity(self, conversation_id: str, agent_id: str) -> dict | None:
+        """This bot's newest work-lane turn here, finished or not: what it last worked on."""
+        conn = self._ensure()
+        with self._lock:
+            row = conn.execute(
+                """
+                SELECT a.* FROM activities a
+                  LEFT JOIN runs r ON r.id = a.run_id
+                 WHERE a.conversation_id = ? AND a.agent_id = ?
+                   AND COALESCE(r.lane, 'work') != 'reply'
+                 ORDER BY a.started_at DESC, a.rowid DESC LIMIT 1
+                """,
+                (conversation_id, agent_id),
+            ).fetchone()
+        return None if row is None else _row(row)
+
+    def live_work_activities(self, conversation_id: str) -> list[dict]:
+        """The open turns actually doing the job: ``reply`` lanes are not a board of work."""
+        conn = self._ensure()
+        with self._lock:
+            rows = conn.execute(
+                """
+                SELECT a.* FROM activities a
+                  LEFT JOIN runs r ON r.id = a.run_id
+                 WHERE a.conversation_id = ?
+                   AND a.status IN ('running', 'awaiting')
+                   AND COALESCE(r.lane, 'work') != 'reply'
+                 ORDER BY a.started_at
+                """,
+                (conversation_id,),
+            ).fetchall()
+        return [_row(row) for row in rows]
+
+    def activity_recent_steps(self, activity_id: str, limit: int = 3) -> list[str]:
+        """The summaries of an activity's newest tool calls, newest last."""
+        conn = self._ensure()
+        with self._lock:
+            rows = conn.execute(
+                """
+                SELECT a.summary FROM actions a
+                  JOIN messages m ON m.action_id = a.id
+                 WHERE m.activity_id = ?
+                 ORDER BY a.rowid DESC LIMIT ?
+                """,
+                (activity_id, max(1, int(limit))),
+            ).fetchall()
+        return [str(row["summary"] or "").strip() for row in reversed(rows) if row["summary"]]
+
     def activity_view(self, activity: dict) -> dict:
         """One activity as the wire wants it: the row plus its derived step count and tool."""
         view = dict(activity)
-        view["steps"] = self.activity_steps(str(activity["id"]))
-        view["current_tool"] = self.activity_tool(str(activity["id"]))
+        activity_id = str(activity["id"])
+        view["steps"] = self.activity_steps(activity_id)
+        view["current_tool"] = self.activity_tool(activity_id)
+        view["todos"] = self.list_activity_todos(activity_id)
+        view["todo_total"] = len(view["todos"])
+        view["todo_done"] = sum(1 for item in view["todos"] if item["status"] == "done")
+        run = self.get_run(str(activity["run_id"])) if activity.get("run_id") else None
+        view["lane"] = str((run or {}).get("lane") or "work")
         return view
 
     # ------------------------------------------------------------------ detail
@@ -362,6 +499,7 @@ class Activities:
             "activity": self.activity_view(activity),
             "conversation_title": conversation["title"] if conversation is not None else "",
             "answer": answer,
+            "notes": self.list_activity_notes(activity_id),
             "sections": [self._section(activity), *(self._section(child) for child in children)],
         }
 

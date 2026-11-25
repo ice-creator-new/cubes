@@ -416,8 +416,17 @@ handle("pick-app-icon", async () => {
   if (!file) return null;
   const image = nativeImage.createFromPath(file);
   if (image.isEmpty()) return null;
+  // A picture that is not square is cut to its centred square first, so it is never stretched.
+  const { width, height } = image.getSize();
+  const side = Math.min(width, height);
+  const square = image.crop({
+    x: Math.floor((width - side) / 2),
+    y: Math.floor((height - side) / 2),
+    width: side,
+    height: side,
+  });
   try {
-    fs.writeFileSync(ICON_CUSTOM, image.resize({ width: 1024, height: 1024, quality: "best" }).toPNG());
+    fs.writeFileSync(ICON_CUSTOM, square.resize({ width: 1024, height: 1024, quality: "best" }).toPNG());
   } catch {
     return null;
   }

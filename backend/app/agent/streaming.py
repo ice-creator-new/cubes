@@ -14,7 +14,13 @@ from ..appearance import MoodStream
 from ..errors import UpstreamError
 from ..fallback import fallback_reason
 from ..model_stream import ModelStream, StreamBroken, StreamSilent
-from ..providers import ResolvedModel, resolve_fallback, resolve_model
+from ..providers import (
+    CLI_PROTOCOLS,
+    ResolvedModel,
+    resolve_dispatch,
+    resolve_fallback,
+    resolve_model,
+)
 from .run_state import ActiveRun
 
 FLUSH_INTERVAL_SECONDS = 0.5
@@ -138,11 +144,24 @@ class Streaming:
         silent: bool = False,
     ) -> tuple[ModelStream, dict | None, str, str | None, list[str], str | None]:
         self._guard(active, author, messages, tools)
+        chosen = model or getattr(active, "model_override", None)
+        if chosen is None and active.lane == "reply":
+            primary = resolve_model(self._store, author, self._settings)
+            if primary.protocol in CLI_PROTOCOLS:
+                # Two CLI sessions must never share one bot at once. A reply lane runs on
+                # the HTTP backup (the launcher resolved it when it could) or the dispatcher's
+                # model; without one it fails honestly instead of opening a second session.
+                chosen = resolve_dispatch(self._store, self._settings)
+                if chosen is None or chosen.protocol in CLI_PROTOCOLS:
+                    raise UpstreamError(
+                        "这个成员用的是本机 CLI 会话，同时在跑两路不安全；"
+                        "请先配一个备用模型，或等它这一轮结束。"
+                    )
         stream = self._completion(
             messages,
             tools=tools,
             author=author,
-            model=model,
+            model=chosen,
             conversation=conversation,
             active=active,
         )

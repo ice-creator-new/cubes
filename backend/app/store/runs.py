@@ -24,12 +24,14 @@ class Runs:
         schedule: dict | None = None,
         reminder: bool = False,
         addresses: list[str] | None = None,
+        lane: str = "work",
     ) -> tuple[dict, dict]:
         """Atomically append the user's goal message and create the running run.
 
         ``schedule`` (``{"id","title"}``) marks a message a scheduled task sent, and links
         the run back to that schedule for the client and for outcome recording. ``reminder``
         marks the trigger of a bot's own reminder, which the client shows as a quiet row.
+        ``lane`` is ``work`` for the job itself and ``reply`` for a lane answering beside it.
         """
         run_id = new_id("r")
         message_id = new_id("m")
@@ -59,8 +61,9 @@ class Runs:
             tx.execute(
                 """
                 INSERT INTO runs
-                    (id, conversation_id, goal, status, current_step, error, model_calls, tool_calls, schedule_id, created_at, updated_at, finished_at)
-                VALUES (?, ?, ?, 'running', ?, NULL, 0, 0, ?, ?, ?, NULL)
+                    (id, conversation_id, goal, status, current_step, error, model_calls,
+                     tool_calls, schedule_id, lane, created_at, updated_at, finished_at)
+                VALUES (?, ?, ?, 'running', ?, NULL, 0, 0, ?, ?, ?, ?, NULL)
                 """,
                 (
                     run_id,
@@ -68,6 +71,7 @@ class Runs:
                     goal,
                     STEP_INITIAL,
                     (schedule or {}).get("id"),
+                    lane,
                     timestamp,
                     timestamp,
                 ),
@@ -77,7 +81,7 @@ class Runs:
         message = self.get_message(message_id)
         assert run is not None and message is not None
         return run, message
-    def begin_bare_run(self, conversation_id: str, goal: str) -> dict:
+    def begin_bare_run(self, conversation_id: str, goal: str, *, lane: str = "work") -> dict:
         """A running run with no user message: a workflow walk that is not an answer.
 
         The steps' own posts are the conversation; inventing a user line for "start the
@@ -89,10 +93,11 @@ class Runs:
             tx.execute(
                 """
                 INSERT INTO runs
-                    (id, conversation_id, goal, status, current_step, error, model_calls, tool_calls, schedule_id, created_at, updated_at, finished_at)
-                VALUES (?, ?, ?, 'running', ?, NULL, 0, 0, NULL, ?, ?, NULL)
+                    (id, conversation_id, goal, status, current_step, error, model_calls,
+                     tool_calls, schedule_id, lane, created_at, updated_at, finished_at)
+                VALUES (?, ?, ?, 'running', ?, NULL, 0, 0, NULL, ?, ?, ?, NULL)
                 """,
-                (run_id, conversation_id, goal, STEP_INITIAL, timestamp, timestamp),
+                (run_id, conversation_id, goal, STEP_INITIAL, lane, timestamp, timestamp),
             )
             self._touch(tx, conversation_id)
         run = self.get_run(run_id)
@@ -130,47 +135,18 @@ class Runs:
                 """
             ).fetchall()
         return [self._run_row(row) for row in rows]
+
+    def active_runs_in(self, conversation_id: str) -> list[dict]:
+        """Every live lane of one conversation, oldest first."""
+        conn = self._ensure()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM runs WHERE status = 'running' AND conversation_id = ? "
+                "ORDER BY rowid ASC",
+                (conversation_id,),
+            ).fetchall()
+        return [self._run_row(row) for row in rows]
     # ------------------------------------------------------------------ queued sends
-
-    def append_user_message(
-        self,
-        conversation_id: str,
-        content: str,
-        mentions: list[str] | None = None,
-        *,
-        reply_to_id: str | None = None,
-        attachment_ids: list[str] | None = None,
-        addresses: list[str] | None = None,
-    ) -> dict:
-        """Write one user message with no run of its own: a steer into a running turn.
-
-        The message is ``complete`` at once — it was sent — and the live run hands it to the
-        model at its next call boundary; later turns read it from the transcript like any
-        other user turn.
-        """
-        message_id = new_id("m")
-        with self._transaction() as tx:
-            self._insert_message(
-                tx,
-                message_id=message_id,
-                conversation_id=conversation_id,
-                author_id=None,
-                author_name=USER_AUTHOR_NAME,
-                avatar_seed=None,
-                kind="user",
-                content=content,
-                status="complete",
-                action_id=None,
-                mentions=mentions,
-                reply_to_id=reply_to_id,
-                interrupts=False,
-                addresses=addresses,
-            )
-            self._bind_attachments(tx, message_id, attachment_ids or [])
-            self._touch(tx, conversation_id)
-        message = self.get_message(message_id)
-        assert message is not None
-        return message
 
     def begin_queued_run(
         self,
@@ -181,6 +157,7 @@ class Runs:
         reply_to_id: str | None = None,
         attachment_ids: list[str] | None = None,
         addresses: list[str] | None = None,
+        lane: str = "work",
     ) -> tuple[dict, dict]:
         """Write the message and a ``queued`` run, without starting anything.
 
@@ -215,10 +192,10 @@ class Runs:
                 """
                 INSERT INTO runs
                     (id, conversation_id, goal, status, current_step, error, model_calls,
-                     tool_calls, schedule_id, created_at, updated_at, finished_at)
-                VALUES (?, ?, ?, 'queued', ?, NULL, 0, 0, NULL, ?, ?, NULL)
+                     tool_calls, schedule_id, lane, created_at, updated_at, finished_at)
+                VALUES (?, ?, ?, 'queued', ?, NULL, 0, 0, NULL, ?, ?, ?, NULL)
                 """,
-                (run_id, conversation_id, goal, STEP_QUEUED, timestamp, timestamp),
+                (run_id, conversation_id, goal, STEP_QUEUED, lane, timestamp, timestamp),
             )
             self._touch(tx, conversation_id)
         run = self.get_run(run_id)
@@ -246,6 +223,17 @@ class Runs:
                 (conversation_id,),
             ).fetchone()
         return None if row is None else self._run_row(row)
+
+    def queued_runs(self, conversation_id: str) -> list[dict]:
+        """Every send waiting for this conversation's slots, oldest first."""
+        conn = self._ensure()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM runs WHERE conversation_id = ? AND status = 'queued' "
+                "ORDER BY rowid ASC",
+                (conversation_id,),
+            ).fetchall()
+        return [self._run_row(row) for row in rows]
 
     def promote_queued_run(self, run_id: str) -> tuple[dict, dict] | None:
         """Turn a queued send into a running one; the message stops reading as queued."""
@@ -352,6 +340,7 @@ class Runs:
         pending_agent_ids: list[str] | object = _UNSET,
         hops: int | object = _UNSET,
         wrapped: int | object = _UNSET,
+        lane: str | object = _UNSET,
         finished_at: str | None | object = _UNSET,
     ) -> dict | None:
         sets: list[str] = []
@@ -366,6 +355,7 @@ class Runs:
             ("pending_agent_ids", pending_agent_ids),
             ("hops", hops),
             ("wrapped", wrapped),
+            ("lane", lane),
             ("finished_at", finished_at),
         ):
             if value is _UNSET:
@@ -433,6 +423,7 @@ class Runs:
             "pending_agent_ids": json.loads(row["pending_agent_ids"] or "[]"),
             "hops": row["hops"],
             "schedule_id": row["schedule_id"],
+            "lane": row["lane"] or "work",
             "wrapped": bool(row["wrapped"]),
             "input_tokens": row["input_tokens"],
             "output_tokens": row["output_tokens"],

@@ -1,16 +1,20 @@
 import { describe, expect, it } from "vitest";
-import type { Activity, Message } from "../api/types";
+import type { Activity, Message, Run } from "../api/types";
 import {
   ACTIVITY_PILL,
   ACTIVITY_STATUS_META,
+  TODO_STATUS_META,
   activityChipText,
   activityGlyph,
+  activityLane,
+  activityNoteLabel,
   activityProgressLine,
   activityStepLine,
   activityThinking,
   groupActivitiesByDay,
   groupPlan,
   isLiveActivity,
+  todoProgress,
 } from "./activities";
 
 let seq = 0;
@@ -251,5 +255,71 @@ describe("groupActivitiesByDay", () => {
       new Date(2026, 10, 25, 12, 0),
     );
     expect(groups.map((group) => group.label)).toEqual(["今天", "昨天"]);
+  });
+});
+
+describe("a working lane's board", () => {
+  const todos = [
+    { text: "读 pricing.csv", status: "done" as const },
+    { text: "核对两个渠道", status: "done" as const },
+    { text: "改发布页", status: "done" as const },
+    { text: "补截图", status: "doing" as const },
+    { text: "写结论", status: "pending" as const },
+  ];
+
+  it("counts the finished items and reads them on the card's meta line", () => {
+    const working = activity({ todos });
+    expect(todoProgress(working)).toEqual({ done: 3, total: 5 });
+    expect(activityProgressLine(working, Date.parse("2026-11-25T10:00:42Z"))).toBe("3/5 项");
+  });
+
+  it("counts a dropped item in the total but not as done", () => {
+    const working = activity({
+      todos: [...todos, { text: "写周报", status: "dropped" }],
+      todo_done: 3,
+      todo_total: 6,
+    });
+    expect(todoProgress(working)).toEqual({ done: 3, total: 6 });
+  });
+
+  it("falls back to the items when a payload carries no counts", () => {
+    expect(todoProgress(activity({ todos }))).toEqual({ done: 3, total: 5 });
+    expect(todoProgress(activity({ todos: [], todo_done: 4, todo_total: 2 }))).toEqual({ done: 2, total: 2 });
+  });
+
+  it("keeps the steps and time when the lane wrote no list", () => {
+    const plain = activity();
+    expect(todoProgress(plain)).toEqual({ done: 0, total: 0 });
+    expect(activityProgressLine(plain, Date.parse("2026-11-25T10:00:42Z"))).toBe("3 步 · 42 秒");
+  });
+
+  it("draws each status as its own glyph and word", () => {
+    expect(TODO_STATUS_META.done.glyph).toBe("done");
+    expect(TODO_STATUS_META.doing.glyph).toBe("doing");
+    expect(TODO_STATUS_META.pending.glyph).toBe("todo");
+    expect(TODO_STATUS_META.dropped.glyph).toBe("blocked");
+    expect(TODO_STATUS_META.doing.label).toBe("正在做");
+  });
+});
+
+describe("which lane an activity holds", () => {
+  it("takes the payload's own lane", () => {
+    expect(activityLane(activity({ lane: "reply" }))).toBe("reply");
+    expect(activityLane(activity({ lane: "work" }))).toBe("work");
+  });
+
+  it("falls back to its live run while that run is still listed", () => {
+    const runs = [{ id: "r1", lane: "reply" } as Run];
+    expect(activityLane(activity(), runs)).toBe("reply");
+  });
+
+  it("reads an older payload with no run as ordinary work", () => {
+    expect(activityLane(activity(), [])).toBe("work");
+    expect(activityLane(undefined, [])).toBe("work");
+  });
+
+  it("names what the lane heard", () => {
+    expect(activityNoteLabel("context")).toBe("群里刚才");
+    expect(activityNoteLabel("request")).toBe("用户的新要求");
   });
 });

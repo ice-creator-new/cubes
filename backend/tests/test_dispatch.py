@@ -307,16 +307,18 @@ def test_steer_reaches_a_running_thread(make_backend, upstream) -> None:
 
             run = await run_goal(client, gid, "记得先查资料")
             assert run["status"] == "completed", run
-            thread = await get_conversation(client, task["thread_id"])
 
             # The group message itself is the trigger, and its route says it steered.
             goal = [m for m in (await get_conversation(client, gid))["messages"] if m["kind"] == "user"][-1]
             assert goal["route"]["kind"] == "steer"
             assert goal["route"]["task_id"] == task["id"]
-            notes = [
-                m for m in thread["messages"] if m["kind"] == "user" and "记得先查资料" in m["content"]
-            ]
-            assert notes and "用户在群里对这个任务补了一句" in notes[0]["content"]
+            # The working thread got a request note on its live activity instead of a fake
+            # user message: notes are not transcript rows.
+            live = store_of(backend).live_work_activities(task["thread_id"])
+            assert live
+            notes = store_of(backend).list_activity_notes(str(live[0]["id"]))
+            assert notes and notes[-1]["kind"] == "request"
+            assert "记得先查资料" in notes[-1]["text"]
 
             await client.post(f"/conversations/{gid}/tasks/{task['id']}/stop")
 
@@ -1033,3 +1035,14 @@ def test_an_outsider_at_without_a_supervisor_leaves_a_notice_and_the_button_work
         assert len(kept) == 1 and kept[0].get("invite") is None
 
     asyncio.run(body())
+
+
+def test_a_progress_question_naming_a_member_is_answered_by_that_member() -> None:
+    # 「@主簿 现在什么进度」 asks 主簿 itself: a card can only list what is still running, so a
+    # member whose work waits on the user would read as idle.
+    status = dispatch.Decision(kind=dispatch.KIND_STATUS, reason="问进度")
+    named = dispatch.normalize(status, ["a_zhubu"])
+    assert named.kind == dispatch.KIND_ANSWER
+    assert named.speakers == ("a_zhubu",)
+    # Without a name it stays the group's card.
+    assert dispatch.normalize(status, []).kind == dispatch.KIND_STATUS

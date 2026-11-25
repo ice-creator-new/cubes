@@ -2,7 +2,7 @@
 // activity card; once it is done they fold into one chip above its answer. Every step lives in
 // the activity's detail. Pure so the rule and the wording can be tested without a chat.
 
-import type { Activity, ActivityStatus, Message } from "../api/types";
+import type { Activity, ActivityNote, ActivityStatus, Message, Run, RunLane, TodoStatus } from "../api/types";
 import { elapsedMs } from "./taskProgress";
 
 /** How a status reads and which colour family it takes in the sheet and on the card. */
@@ -30,6 +30,37 @@ export const ACTIVITY_PILL: Record<"live" | "waiting" | "done" | "stopped" | "er
 /** Whether the activity still runs (or waits on the user): its card replaces its rows. */
 export function isLiveActivity(status: ActivityStatus): boolean {
   return status === "running" || status === "awaiting";
+}
+
+/** How one todo item reads, and the glyph its row draws. */
+export const TODO_STATUS_META: Record<TodoStatus, { label: string; glyph: "todo" | "doing" | "done" | "blocked" }> = {
+  pending: { label: "待办", glyph: "todo" },
+  doing: { label: "正在做", glyph: "doing" },
+  done: { label: "完成", glyph: "done" },
+  dropped: { label: "不做", glyph: "blocked" },
+};
+
+/** Finished and total items of the working lane's board; 0/0 when it wrote none. */
+export function todoProgress(activity: Activity): { done: number; total: number } {
+  const todos = activity.todos ?? [];
+  const total = Math.max(0, activity.todo_total ?? todos.length);
+  const done = Math.max(0, activity.todo_done ?? todos.filter((todo) => todo.status === "done").length);
+  return { done: Math.min(done, total), total };
+}
+
+/**
+ * The lane an activity runs on. The payload names it; an older live event that does not is
+ * matched to its run while that run is still listed, and otherwise read as ordinary work.
+ */
+export function activityLane(activity: Activity | undefined, runs: Run[] = []): RunLane {
+  if (activity?.lane) return activity.lane;
+  const run = activity ? runs.find((item) => item.id === activity.run_id) : undefined;
+  return run?.lane ?? "work";
+}
+
+/** What a note the working lane received calls itself in the sheet. */
+export function activityNoteLabel(kind: ActivityNote["kind"]): string {
+  return kind === "request" ? "用户的新要求" : "群里刚才";
 }
 
 /** One line under a live card: what it is doing, else its newest sentence, else a quiet wait. */
@@ -71,10 +102,16 @@ export function activityTime(ms: number): string {
   return rest ? `${hours} 小时 ${rest} 分` : `${hours} 小时`;
 }
 
-/** A running card's small print: how many steps so far and how long it has been at it. */
+/**
+ * A running card's small print: its board's count when the lane keeps one (「3/5 项」), else
+ * how many steps it has taken and how long it has been at it.
+ */
 export function activityProgressLine(activity: Activity, now: number): string {
+  const { done, total } = todoProgress(activity);
+  if (total > 0) return `${done}/${total} 项`;
   const time = activityTime(elapsedMs(activity.started_at, now, activity.finished_at));
-  return `${activity.steps} 步 · ${time}`;
+  // A turn that has not called anything yet reads as time alone; 「0 步」 says nothing.
+  return activity.steps > 0 ? `${activity.steps} 步 · ${time}` : time;
 }
 
 /**

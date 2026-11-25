@@ -1,11 +1,13 @@
-"""Task-driven supervisor engine: one run per conversation, real model calls only.
+"""Task-driven supervisor engine: lanes of runs, real model calls only.
 
-Each conversation owns at most one run and different conversations run in parallel. A run
-is a queue of agents: the message that starts it decides who replies first, every completed
-reply may hand the turn to further agents with ``@名字`` (at most :data:`RELAY_HOPS`
-hand-offs, then one conclusion for the user), and whatever the model produced before a stop,
-a budget stop or an upstream failure is kept and marked ``interrupted``/``error`` — never
-completed. Subscribers are engine-wide, so one SSE stream reports every run.
+A conversation may run several lanes at once: one work lane doing the job and reply lanes
+answering newer user messages beside it (up to the launcher's caps). Different conversations
+always run in parallel. A run is a queue of agents: the message that starts it decides who
+replies first, every completed reply may hand the turn to further agents with ``@名字`` (at
+most :data:`RELAY_HOPS` hand-offs, then one conclusion for the user), and whatever the model
+produced before a stop, a budget stop or an upstream failure is kept and marked
+``interrupted``/``error`` — never completed. Subscribers are engine-wide, so one SSE stream
+reports every run.
 """
 
 from __future__ import annotations
@@ -38,7 +40,15 @@ from .agent.activity import Activities
 from .agent.context import ContextWindow
 from .agent.memory import MemoryExtraction
 from .agent.reactions import ReactionResponses
-from .agent.run_state import ACTIVITY, GROUP_TASK, ActiveRun, QueuedAgent, TurnBudget
+from .agent.run_state import (
+    ACTIVITY,
+    GROUP_TASK,
+    LANES_PER_GROUP,
+    ActiveRun,
+    QueuedAgent,
+    TurnBudget,
+)
+from .store import activities as activity_rules
 from .store import group_tasks as task_rules
 from .engine_workflows import WorkflowWalking
 from .agent.streaming import Streaming
@@ -73,6 +83,7 @@ from .constants import STEP_COMPLETED, STEP_ERROR, STEP_LIMITED, STEP_STOPPED
 from .store import Store, new_id, now_iso
 from .toolkit import ToolInputError
 from .tools import ask as ask_tools
+from .tools import board as board_tools
 from .tools import computer as computer_tools
 from .tools import group_tasks as group_task_tools
 from .tools import connectors as connector_tools
@@ -158,6 +169,7 @@ class SupervisorEngine(
     def __init__(self, settings: Settings, store: Store) -> None:
         self._settings = settings
         self._store = store
+        # Keyed by run id: a conversation may hold a work lane and reply lanes at once.
         self._runs: dict[str, ActiveRun] = {}
         self._subscribers: set[asyncio.Queue[tuple[str, Any] | None]] = set()
         self._streams_closed = False
@@ -300,44 +312,60 @@ class SupervisorEngine(
         return active is not None and active.task is not None and not active.task.done()
 
     def is_running(self, conversation_id: str | None = None) -> bool:
-        """Whether one conversation (or any conversation) currently has a live run."""
+        """Whether one conversation (or any conversation) currently has a live lane."""
         if conversation_id is None:
             return any(self._alive(active) for active in self._runs.values())
-        return self._alive(self._runs.get(conversation_id))
+        return any(
+            self._alive(active)
+            for active in self._runs.values()
+            if active.conversation_id == conversation_id
+        )
+
+    def live_lanes(self, conversation_id: str) -> list[ActiveRun]:
+        """Every live lane of one conversation, oldest first."""
+        return [
+            active
+            for active in self._runs.values()
+            if active.conversation_id == conversation_id and self._alive(active)
+        ]
 
     def live_run_in(self, conversation_id: str) -> ActiveRun | None:
-        """The run whose task is alive in this conversation, whatever its row says."""
-        active = self._runs.get(conversation_id)
-        return active if self._alive(active) else None
+        """A live lane in this conversation, preferring the work lane, whatever rows say."""
+        lanes = self.live_lanes(conversation_id)
+        for active in lanes:
+            if active.lane != "reply":
+                return active
+        return lanes[0] if lanes else None
 
     def live_run(self, run_id: str) -> ActiveRun | None:
         """The in-process run behind one row, if its task is still alive."""
-        active = next((run for run in self._runs.values() if run.run_id == run_id), None)
+        active = self._runs.get(run_id)
         return active if self._alive(active) else None
 
-    def steer(self, active: ActiveRun, message: dict) -> None:
-        """Let a user message join the turn now running; the model reads it at its next call.
+    def add_note(
+        self,
+        active: ActiveRun,
+        *,
+        kind: str,
+        text: str,
+        source_message_id: str | None = None,
+    ) -> None:
+        """Save one note for a live lane; its loop reads it at the next call boundary."""
+        active.notes.append(
+            {"kind": kind, "text": text, "source_message_id": source_message_id}
+        )
 
-        Nothing touches the request already on the wire: the loop hands the message over at
-        the top of its next iteration, so a stream is never mutated mid-flight.
-        """
-        active.steers.append(message)
-        self._publish_message("message_end", message)
-
-    def _deliver_steers(self, active: ActiveRun, messages: list[dict[str, Any]]) -> bool:
-        """Append every waiting steer as a user turn; True when one was waiting."""
-        steers = active.take_steers()
-        for message in steers:
-            quoted = (
-                self._store.get_message(message["reply_to_id"])
-                if message.get("reply_to_id")
-                else None
+    def _deliver_notes(self, active: ActiveRun, messages: list[dict[str, Any]]) -> bool:
+        """Append every waiting note as a user turn; True when one was waiting."""
+        notes = active.take_notes()
+        for note in notes:
+            lead = (
+                prompts.NOTE_REQUEST_NOTE
+                if note.get("kind") == "request"
+                else prompts.NOTE_CONTEXT_NOTE
             )
-            content = history.user_turn_content(
-                message, {quoted["id"]: quoted} if quoted is not None else {}
-            )
-            messages.append({"role": "user", "content": f"{prompts.STEER_NOTE}\n{content}"})
-        return bool(steers)
+            messages.append({"role": "user", "content": f"{lead}\n{note['text']}"})
+        return bool(notes)
 
     def start(
         self,
@@ -351,19 +379,25 @@ class SupervisorEngine(
         task_id: str | None = None,
         task_instruction: str | None = None,
         route_override: list[str] | None = None,
+        lane: str = "work",
+        model_override: Any = None,
     ) -> None:
-        """Start one conversation's run; the caller must have reserved that slot.
+        """Start one conversation's lane; the caller must have reserved that slot.
 
         ``schedule_id`` marks a run a scheduled task started: it is offered no schedule
         tools (no recursion) and, when the user pre-approved the sandbox, it starts with
         the computer already allowed so no consent card is shown. ``route_override`` names
         the speakers for this one message (the user's own reroute).
         """
-        if self.is_running(conversation_id):
-            raise EngineBusy("该会话已有任务正在运行，请等待当前任务结束。")
+        if run_id in self._runs:
+            raise EngineBusy("这次任务已经在运行了。")
+        if len(self.live_lanes(conversation_id)) >= LANES_PER_GROUP:
+            raise EngineBusy("这个会话同时在跑的任务已经到上限，等其中一路结束再开始。")
         active = ActiveRun(
             run_id=run_id,
             conversation_id=conversation_id,
+            lane=lane,
+            model_override=model_override,
             trigger_message_id=message_id,
             schedule_id=schedule_id,
             background=self._store.is_background_conversation(conversation_id),
@@ -374,7 +408,7 @@ class SupervisorEngine(
             route_override=list(route_override or []),
             activity_parent=ACTIVITY.get(),
         )
-        self._runs[conversation_id] = active
+        self._runs[run_id] = active
         active.task = asyncio.create_task(self._supervise(active))
 
     async def stop(self, run_id: str, *, timeout: float | None = None) -> bool:
@@ -383,7 +417,7 @@ class SupervisorEngine(
         ``timeout`` bounds the cooperative wait before the task is cancelled outright;
         ``None`` uses the configured ``STOP_TIMEOUT``.
         """
-        active = next((run for run in self._runs.values() if run.run_id == run_id), None)
+        active = self._runs.get(run_id)
         if active is None or active.task is None:
             return False
         active.stop_requested = True
@@ -1067,6 +1101,7 @@ class SupervisorEngine(
                 author,
                 scheduled=active.schedule_id is not None,
                 coordinating=coordinating,
+                read_only=active.lane == "reply",
             )
 
         messages = await self._turn_context(active, conversation, author, tools(), context)
@@ -1082,8 +1117,8 @@ class SupervisorEngine(
             while True:
                 if active.stop_requested:
                     raise RunStopped("任务已停止。")
-                # A message the user steered in joins here, at a call boundary, never mid-stream.
-                self._deliver_steers(active, messages)
+                # A note another lane left joins here, at a call boundary, never mid-stream.
+                self._deliver_notes(active, messages)
                 tools_now = tools()
                 stream, current, body, mood, images, reaction = await self._stream_reply(
                     active,
@@ -1143,12 +1178,12 @@ class SupervisorEngine(
                             self._publish_message("message_end", current)
                     message = current or message
                 if not calls:
-                    # The reply is done but a steer may have landed while it streamed: the
-                    # user is waiting for it to be taken into account, so answer in this turn.
-                    if active.steers:
+                    # The reply is done but a note may have landed while it streamed: read
+                    # it now, so the next call answers with it in context.
+                    if active.notes:
                         if body:
                             messages.append({"role": "assistant", "content": body})
-                        self._deliver_steers(active, messages)
+                        self._deliver_notes(active, messages)
                         continue
                     if nudge:
                         # The reply stopped on a lead-in without ask_user: one more call,
@@ -1217,7 +1252,9 @@ class SupervisorEngine(
             active,
             conversation,
             agent,
-            self._schemas("member", conversation, agent),
+            self._schemas(
+                "member", conversation, agent, read_only=active.lane == "reply"
+            ),
             lambda: self._member_context(
                 conversation,
                 roster,
@@ -1337,47 +1374,64 @@ class SupervisorEngine(
         )
 
     async def _start_task(
-        self, active: ActiveRun, task: dict | None, title: str, plan: str
+        self,
+        active: ActiveRun,
+        task: dict | None,
+        title: str,
+        plan: str,
+        *,
+        owner_id: str | None = None,
     ) -> dict:
-        """Turn this group turn into a hidden thread run (``start_task``).
+        """Turn this chat turn into a hidden thread run (``start_task``).
 
-        A plain group reply makes no task row, so the row is created here — the first moment
-        the member says the work needs a thread. The card appears right away, so the group
-        sees the work from its first second; the actual turn runs in the task's thread.
+        A plain reply makes no task row, so the row is created here — the first moment the
+        bot says the work needs a thread. The card appears right away, so the chat sees the
+        work from its first second; the actual turn runs in the task's thread. ``owner_id``
+        is the supervisor handing the work to a member: the card and the thread are theirs,
+        and the task never waits for the supervisor's own lane.
         """
-        group = self._store.get_conversation(active.conversation_id) or {}
-        agent = self._store.get_agent(active.turn.agent_id) if active.turn else None
+        chat = self._store.get_conversation(active.conversation_id) or {}
+        author = self._store.get_agent(active.turn.agent_id) if active.turn else None
         if task is None:
-            request = self._trigger_message(active, group) if group else None
+            request = self._trigger_message(active, chat) if chat else None
             if (
-                agent is None
-                or not group
-                or group["kind"] != "group"
+                author is None
+                or not chat
+                or chat["kind"] not in ("group", "direct")
                 or request is None
                 or request["kind"] not in ("user", "agent")
             ):
                 raise UpstreamError("任务已经失效，无法开始。")
+            owner = self._store.get_agent(owner_id) if owner_id else author
+            if owner is None:
+                raise UpstreamError("要交给的成员不在了，无法开始。")
             task = self._store.create_group_task(
-                conversation_id=group["id"],
-                owner_id=agent["id"],
+                conversation_id=chat["id"],
+                owner_id=owner["id"],
                 title=title,
                 instruction=str(request.get("content") or title),
                 request_message_id=request["id"],
+                assigned_by=author["id"] if owner["id"] != author["id"] else None,
                 run_id=None,
                 status=task_rules.QUEUED,
             )
-        if agent is None:
-            agent = self._store.get_agent(task["owner_id"])
-        if agent is None or not group:  # pragma: no cover - the caller's own task
+        owner_ref = owner_id or (task["owner_id"] if task else None)
+        agent = self._store.get_agent(owner_ref) if owner_ref else None
+        if agent is None or not chat:  # pragma: no cover - the caller's own task
             raise UpstreamError("任务已经失效，无法开始。")
         instruction = task.get("instruction") or task["title"]
         if plan:
             instruction = f"{instruction}\n\n{agent['name']}的计划：{plan}"
-        task = self._store.update_group_task(
-            task["id"], title=title, instruction=instruction
-        ) or task
+        changes: dict[str, Any] = {
+            "title": title,
+            "instruction": instruction,
+            "owner_id": agent["id"],
+        }
+        if author is not None and author["id"] != agent["id"]:
+            changes["assigned_by"] = author["id"]
+        task = self._store.update_group_task(task["id"], **changes) or task
         self._thread_of(task, agent)
-        card = self._append_task_card(active, group, agent, task)
+        card = self._append_task_card(active, chat, agent, task)
         task = self._store.update_group_task(
             task["id"],
             card_message_id=card["id"],
@@ -1387,14 +1441,19 @@ class SupervisorEngine(
             started_at=None,
             latest_text="",
         ) or task
-        opening = self._thread_opening(group, task, task.get("request_message_id"))
+        opening = self._thread_opening(chat, task, task.get("request_message_id"))
         if plan:
             opening = f"{opening}\n\n你打算这样做：{plan}"
-        self._publish_group_tasks(None, group["id"])
+        self._publish_group_tasks(None, chat["id"])
         self._publish_workspace()
         if self.task_scheduler is None:  # pragma: no cover - the app wires it in
             raise UpstreamError("任务通道没有就绪，暂时无法开始。")
-        started = await self.task_scheduler.enqueue(task["id"], instruction=opening)
+        # A reply lane that starts its own bot's work waits for that bot's live lane. Work
+        # handed to another member runs in that member's thread and needs no wait.
+        behind = active.lane == "reply" and author is not None and author["id"] == agent["id"]
+        started = await self.task_scheduler.enqueue(
+            task["id"], instruction=opening, behind_lane=behind
+        )
         return started or task
 
     async def _thread_reply(
@@ -1552,12 +1611,13 @@ class SupervisorEngine(
         trigger: str,
         reply_to_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """A thread turn's request: the thread's own history plus a compact view of the group.
+        """A thread turn's request: the thread's own history plus a compact view of the chat.
 
-        The system prompt states the group (its title, rules and members) because that is who
-        the answer is for; the working set is keyed to the group, so files stay shared between
-        the task's thread and everyone else working in that group.
+        The system prompt states the surface (a group's title, rules and members, or the user's
+        own chat) because that is who the answer is for; the working set is keyed to that chat,
+        so files stay shared between the task's thread and everyone else working there.
         """
+        direct = group["kind"] == "direct"
         system = prompts.member_system(
             agent=agent,
             conversation_kind="thread",
@@ -1568,7 +1628,10 @@ class SupervisorEngine(
             groups=self._member_groups(agent),
             memory=self._memory_block(group, agent, trigger),
             skills=self._skills_block(agent),
-            hints=(prompts.group_rules_block(group.get("rules") or ""),),
+            hints=(prompts.group_rules_block(group.get("rules") or ""),)
+            if not direct
+            else (),
+            thread_surface="direct" if direct else "group",
         )
         messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         messages.extend(
@@ -1584,7 +1647,9 @@ class SupervisorEngine(
             opening = self._thread_opening(group, task, reply_to_id)
         if opening is not None:
             messages.append({"role": "user", "content": opening})
-        view = prompts.thread_group_view(group["title"], self._recent_group_lines(group))
+        view = prompts.thread_group_view(
+            group["title"], self._recent_group_lines(group), direct=direct
+        )
         history.attach_runtime(
             messages,
             moment=self._now(),
@@ -1604,6 +1669,7 @@ class SupervisorEngine(
         teammate that started it. Anything else falls back to the task's own wording.
         """
         answered = self._store.get_message(reply_to_id) if reply_to_id else None
+        where = "聊天里" if group["kind"] == "direct" else "群里"
         if answered is not None and answered["conversation_id"] == group["id"]:
             if answered["kind"] == "user":
                 quoted = (
@@ -1614,11 +1680,19 @@ class SupervisorEngine(
                 text = history.user_turn_content(
                     answered, {quoted["id"]: quoted} if quoted is not None else {}
                 )
-                return prompts.thread_work_instruction(task["title"], text)
+                opening = prompts.thread_work_instruction(task["title"], text, where=where)
+                giver = (
+                    self._store.get_agent(str(task["assigned_by"]))
+                    if task.get("assigned_by")
+                    else None
+                )
+                if giver is not None and giver["id"] != task["owner_id"]:
+                    opening = f"「{giver['name']}」把用户这件事交给你，由你负责到底。\n\n{opening}"
+                return opening
             if answered["kind"] == "agent":
                 return prompts.mention_instruction(answered["author_name"], answered["content"])
         return prompts.thread_task_instruction(
-            task["instruction"] or task["title"], task["title"]
+            task["instruction"] or task["title"], task["title"], where=where
         )
 
     def _sibling_tasks_hint(self, group: dict, task: dict) -> str:
@@ -1646,8 +1720,9 @@ class SupervisorEngine(
             lines.append("，".join(parts))
         if not lines:
             return ""
+        place = "这个聊天里" if group["kind"] == "direct" else "同一个群里"
         return (
-            "<siblings>\n同一个群里还有这些任务在同时做（不要改对方正在做的文件，"
+            f"<siblings>\n{place}还有这些任务在同时做（不要改对方正在做的文件，"
             "需要它时先等它或问用户）：\n" + "\n".join(lines) + "\n</siblings>"
         )
 
@@ -1665,12 +1740,38 @@ class SupervisorEngine(
 
     # ------------------------------------------------------------------ group tasks
 
+    def note_work_activity(
+        self,
+        activity_id: str,
+        *,
+        kind: str,
+        text: str,
+        source_message_id: str | None = None,
+    ) -> bool:
+        """Leave a note on one live work activity and wake the lane serving it."""
+        activity = self._store.get_activity(activity_id)
+        if activity is None or activity["status"] not in activity_rules.UNFINISHED:
+            return False
+        self._store.add_activity_note(
+            activity_id,
+            kind=kind,
+            text=text,
+            source_message_id=source_message_id,
+        )
+        active = self.live_run(str(activity.get("run_id") or ""))
+        if active is not None:
+            self.add_note(
+                active, kind=kind, text=text, source_message_id=source_message_id
+            )
+        return True
+
     async def _steer_task(self, conversation: dict, task_id: str | None, trigger: dict) -> bool:
         """Deliver one user message into the task it is really about.
 
-        A running (or waiting) task takes it as a steer at its next call boundary; a queued
-        one keeps it for the opening its thread starts with. ``False`` when the task is gone
-        or already finished, so the caller can still answer in the group.
+        A running (or waiting) task's work activity takes it as a ``request`` note at its
+        next call boundary; a queued one keeps it for the opening its thread starts with.
+        ``False`` when the task is gone or already finished, so the caller can still answer
+        in the group.
         """
         task = self._store.get_group_task(task_id) if task_id else None
         if task is None or task["conversation_id"] != conversation["id"]:
@@ -1682,16 +1783,24 @@ class SupervisorEngine(
             return False
         if task["status"] in (task_rules.RUNNING, task_rules.AWAITING):
             active = self.live_run(str(task.get("run_id") or ""))
-            thread_id = task.get("thread_id")
-            if active is None or not thread_id:
+            if active is None:
                 return False
-            message = self._store.append_user_message(
-                str(thread_id),
-                f"{prompts.TASK_STEER_NOTE}\n{text}",
-                [str(task["owner_id"])],
-            )
-            self.steer(active, message)
-            return True
+            noted = False
+            for activity in self._store.activities_of_run(
+                str(task.get("run_id") or ""), unfinished=True
+            ):
+                if str(activity.get("agent_id") or "") != str(task["owner_id"]):
+                    continue
+                noted = (
+                    self.note_work_activity(
+                        str(activity["id"]),
+                        kind="request",
+                        text=text,
+                        source_message_id=str(trigger.get("id") or "") or None,
+                    )
+                    or noted
+                )
+            return noted
         if task["status"] == task_rules.QUEUED and self.task_scheduler is not None:
             updated = self.task_scheduler.note_instruction(str(task["id"]), text)
             if updated is not None:
@@ -1781,8 +1890,25 @@ class SupervisorEngine(
                     "waiting_for": waiting_for,
                 }
             )
+        activities: list[dict[str, Any]] = []
+        for activity in self._store.live_work_activities(conversation["id"]):
+            activity_id = str(activity["id"])
+            todos = self._store.list_activity_todos(activity_id)
+            activities.append(
+                {
+                    "activity_id": activity_id,
+                    "agent": activity["agent_name"],
+                    "title": activity["title"],
+                    "current_step": str(activity.get("current_step") or ""),
+                    "latest": str(activity.get("latest_text") or ""),
+                    "todos": todos,
+                    "todo_done": sum(1 for item in todos if item["status"] == "done"),
+                    "todo_total": len(todos),
+                }
+            )
+            busy.add(str(activity["agent_id"]))
         idle = [agent["name"] for agent_id, agent in by_owner.items() if agent_id not in busy]
-        return {"tasks": tasks, "idle": idle}
+        return {"tasks": tasks, "activities": activities, "idle": idle}
 
     def _close_task(self, task: dict | None, message: dict | None) -> None:
         """A turn that ended normally finished its task, unless it handed the task on."""
@@ -2165,14 +2291,15 @@ class SupervisorEngine(
             while True:
                 if active.stop_requested:
                     raise RunStopped("任务已停止。")
-                # A message the user steered in joins here, at a call boundary, never mid-stream.
-                self._deliver_steers(active, messages)
+                # A note another lane left joins here, at a call boundary, never mid-stream.
+                self._deliver_notes(active, messages)
                 tools_now = self._schemas(
                     role,
                     surface or conversation,
                     agent,
                     from_thread=bool(active.task_id)
                     or self._conversation_kind(active.conversation_id) == "thread",
+                    read_only=active.lane == "reply",
                 )
                 stream, current, body, mood, images, reaction = await self._stream_reply(
                     active,
@@ -2227,11 +2354,11 @@ class SupervisorEngine(
                             self._publish_message("message_end", current)
                     message = current or message
                 if not calls:
-                    # A reply that ended while a steer was landing still answers it here.
-                    if active.steers:
+                    # A reply that ended while a note was landing still reads it here.
+                    if active.notes:
                         if body:
                             messages.append({"role": "assistant", "content": body})
-                        self._deliver_steers(active, messages)
+                        self._deliver_notes(active, messages)
                         continue
                     if nudge:
                         nudged = True
@@ -2360,12 +2487,32 @@ class SupervisorEngine(
             return error_result(message), []
 
         turn = active.turn
-        if turn is not None and turn.wrapping:
+        if turn is not None and turn.wrapping and not (
+            # A reply lane's way out is handing the work off: the lookup cap's refusal names
+            # ``start_task``, so that one call still runs while the turn wraps.
+            active.lane == "reply" and call.name == START_TASK
+        ):
             # The bot already had the call it may answer with, and asked for another tool:
             # end its turn with what it wrote. Never the run it is nested in.
             reason = f"{turn.label}的调用预算用完了"
             self._record_unexecuted(active, conversation, call, label, reason, author)
             raise TurnLimited(f"{reason}，这一轮先停在这里。")
+        if (
+            active.lane == "reply"
+            and turn is not None
+            and call.name != START_TASK
+            and turn.reply_calls >= prompts.REPLY_TOOL_CAP
+        ):
+            # A reply lane answers beside the work and may look a couple of things up; the
+            # reading a task needs belongs to the task's own thread. ``start_task`` is the
+            # hand-off, so it never spends this cap.
+            reason = prompts.REPLY_TOOL_LIMIT_NOTE
+            self._record_unexecuted(
+                active, conversation, call, label, f"{reason}，本次调用没有执行。", author
+            )
+            # The rest of the batch is refused the same way; its next call is the answer.
+            turn.wrap_pending = True
+            return error_result(f"{reason}。{prompts.TURN_WRAP_NOTE}"), []
         uses_computer = handler is not None and handler.computer_step
         budget = step_budget.budget_for(self._store, self._settings)
         if uses_computer:
@@ -2406,6 +2553,9 @@ class SupervisorEngine(
         if turn is not None:
             turn.tool_calls += 0 if uses_computer else 1
             turn.computer_steps += 1 if uses_computer else 0
+            if active.lane == "reply" and call.name != START_TASK:
+                # Counted after the gate above, so the cap allows exactly this many lookups.
+                turn.reply_calls += 1
         self._store.update_run(active.run_id, tool_calls=run["tool_calls"] + 1)
         if call.name != START_TASK:
             # Opening the task is the group turn's own decision, not one of its work steps.
@@ -3161,6 +3311,13 @@ class SupervisorEngine(
             self._post_status_card(active, conversation)
             return []
         if decision.kind == dispatch_rules.KIND_STEER:
+            if decision.affects and self.note_work_activity(
+                decision.affects,
+                kind="request",
+                text=str(trigger.get("content") or ""),
+                source_message_id=str(trigger.get("id") or "") or None,
+            ):
+                return []
             if await self._steer_task(conversation, decision.task_id, trigger):
                 return []
         elif decision.kind == dispatch_rules.KIND_RESUME:
@@ -3195,6 +3352,14 @@ class SupervisorEngine(
                 if not posted_status:
                     self._post_status_card(active, conversation)
                     posted_status = True
+                continue
+            if intent.affects and self.note_work_activity(
+                intent.affects,
+                kind="request",
+                text=intent.text or str(trigger.get("content") or ""),
+                source_message_id=str(trigger.get("id") or "") or None,
+            ):
+                queued_any = True
                 continue
             if intent.kind == dispatch_rules.KIND_STEER:
                 if await self._steer_task(conversation, intent.task_id, trigger):
@@ -3389,6 +3554,7 @@ class SupervisorEngine(
             else None
         )
         tasks = self._open_task_lines(conversation)
+        activities = self._open_activity_lines(conversation)
         interrupted = self._interrupted_agent(conversation, roster)
         member_ids = {str(agent["id"]) for agent in roster}
         outside = [
@@ -3432,6 +3598,7 @@ class SupervisorEngine(
             "interrupted": self._agent_name(interrupted) if interrupted else None,
             "recent": self._recent_group_lines(conversation, limit=12),
             "tasks": tasks,
+            "activities": activities,
             "message": str(trigger.get("content") or ""),
         }
         messages = dispatch_rules.messages(context)
@@ -3486,6 +3653,7 @@ class SupervisorEngine(
             member_ids=[str(agent["id"]) for agent in roster],
             task_ids=task_ids,
             invite_ids=[str(agent["id"]) for agent in outside],
+            activity_ids=[str(activity["id"]) for activity in activities],
         )
         if decision is None:
             logger.warning("群组分发结果读不懂：%s", " ".join(answer.split())[:300])
@@ -3533,6 +3701,26 @@ class SupervisorEngine(
                     ],
                     "reason": task.get("end_reason") or "",
                     "age": working_set.age(str(task["updated_at"]), now),
+                }
+            )
+        return lines
+
+    def _open_activity_lines(self, conversation: dict) -> list[dict[str, Any]]:
+        """Every live working lane the dispatcher may steer a new requirement into."""
+        lines: list[dict[str, Any]] = []
+        for activity in self._store.live_work_activities(conversation["id"]):
+            activity_id = str(activity["id"])
+            todos = self._store.list_activity_todos(activity_id)
+            lines.append(
+                {
+                    "id": activity_id,
+                    "agent": activity["agent_name"],
+                    "title": activity["title"],
+                    "status": activity["status"],
+                    "current": str(activity.get("current_step") or ""),
+                    "todos": todos,
+                    "done": sum(1 for item in todos if item["status"] == "done"),
+                    "total": len(todos),
                 }
             )
         return lines
@@ -3640,6 +3828,60 @@ class SupervisorEngine(
         return resolve.peer(self._store, conversation, agent)
 
     # ------------------------------------------------------------------ context
+
+    def _lane_system_note(
+        self, active: ActiveRun, conversation: dict, author: dict
+    ) -> str:
+        """What this lane owes its turn: a to-do board for work, real progress for a reply."""
+        if active.lane == "reply":
+            progress = self._reply_progress_note(conversation, author)
+            return f"{prompts.REPLY_LANE_RULE}\n\n{progress}" if progress else prompts.REPLY_LANE_RULE
+        if conversation["kind"] in ("group", "thread", "direct"):
+            return prompts.TODO_RULE
+        return ""
+
+    def _board_lines(self, activity: dict, *, prefix: str = "") -> str:
+        """One activity's board as the sentence a reply lane may quote."""
+        activity_id = str(activity["id"])
+        todos = self._store.list_activity_todos(activity_id)
+        done = "、".join(item["text"] for item in todos if item["status"] == "done")
+        doing = "、".join(item["text"] for item in todos if item["status"] == "doing")
+        pending = "、".join(
+            item["text"] for item in todos if item["status"] in ("pending", "doing")
+        )
+        steps = "；".join(self._store.activity_recent_steps(activity_id, 3))
+        doing = doing or str(activity.get("current_step") or "")
+        steps = steps or str(activity.get("latest_text") or "")
+        return prompts.REPLY_PROGRESS_NOTE.format(
+            title=f"{prefix}{activity['title']}",
+            done=done or "暂无",
+            doing=doing or "暂无",
+            pending=pending or "暂无",
+            steps=steps or "暂无",
+        )
+
+    def _reply_progress_note(self, conversation: dict, author: dict) -> str:
+        """The board of every live lane in this conversation, its own work lane first."""
+        live = self._store.live_work_activities(conversation["id"])
+        if not any(str(row.get("agent_id")) == str(author.get("id")) for row in live):
+            # Its own work ended (or waits on the user's answers): its last board still says
+            # what it did and what is left, which is exactly what a progress question asks.
+            last = self._store.last_work_activity(conversation["id"], str(author.get("id")))
+            if last is not None:
+                live.append(last)
+        if not live:
+            return ""
+        live.sort(key=lambda row: str(row.get("agent_id")) != str(author.get("id")))
+        lines = [
+            self._board_lines(
+                activity,
+                prefix=""
+                if str(activity.get("agent_id")) == str(author.get("id"))
+                else f"「{activity.get('agent_name') or '同事'}」",
+            )
+            for activity in live
+        ]
+        return "\n".join(lines)
 
     def _supervisor_context(
         self,
@@ -4019,6 +4261,7 @@ class SupervisorEngine(
         scheduled: bool = False,
         coordinating: bool = False,
         from_thread: bool = False,
+        read_only: bool = False,
     ) -> list[dict[str, Any]]:
         """Every tool this role may call here, straight from the registry.
 
@@ -4034,6 +4277,7 @@ class SupervisorEngine(
             scheduled=scheduled,
             coordinating=coordinating,
             from_thread=from_thread,
+            read_only=read_only,
         )
         return self._registry(offer).schemas(offer)
 
@@ -4045,6 +4289,8 @@ class SupervisorEngine(
             author=author,
             scheduled=active.schedule_id is not None,
             coordinating=self._supervisor_coordinates(active, conversation, author),
+            # A reply lane may look up and answer, never change the workspace.
+            read_only=active.lane == "reply",
             # A thread run already works a task; offering to open another is noise.
             from_thread=bool(active.task_id)
             or self._conversation_kind(active.conversation_id) == "thread",
@@ -4066,6 +4312,7 @@ class SupervisorEngine(
             *skills_tools.handlers(self._store, self.computer),
             *workflow_tools.handlers(self._store, self._run_workflow),
             *special_tools.handlers(),
+            *board_tools.handlers(),
             *group_task_tools.handlers(),
             *task_tool.handlers(),
             *ask_tools.handlers(),
@@ -4140,6 +4387,10 @@ class SupervisorEngine(
             connectors=self.connectors,
             publish=self._publish,
             publish_message=self._publish_message,
+            publish_activity=lambda activity_id: self._publish_activity(
+                self._store.get_activity(activity_id), force=True
+            ),
+            activity_id=ACTIVITY.get(),
             publish_workspace=self._publish_workspace,
             publish_sidebar=self._publish_sidebar,
             publish_schedules=self._publish_schedules,
@@ -4169,7 +4420,9 @@ class SupervisorEngine(
             assign_part=lambda group, agent, instruction, parent: self._assign_part(
                 active, group, author, agent, instruction, parent, action_message_id
             ),
-            start_task=lambda task, title, plan: self._start_task(active, task, title, plan),
+            start_task=lambda task, title, plan, owner_id=None: self._start_task(
+                active, task, title, plan, owner_id=owner_id
+            ),
             group_busy=lambda conversation_id: conversation_id != active.conversation_id
             and self.is_running(conversation_id),
             review_member=lambda conversation, agent, task, messages, reply_to_id, roster, text, message: self._review_member_answer(
@@ -4362,6 +4615,11 @@ class SupervisorEngine(
         if turn is not None and not budget.turn_model_calls:
             # No turn ceiling either: the model calls are free to continue until it answers.
             turn.model_calls += 1
+            if turn.wrap_pending:
+                # A wrap asked for outside the presets (a reply lane's lookup cap): this call
+                # answers with what the turn already found, and the next tool ends the turn.
+                turn.wrap_pending, turn.wrapping = False, True
+                turn.wrapped = False
         elif turn is not None:
             turn_limit = budget.turn_model_calls + turn.computer_steps
             if turn.wrap_pending:
@@ -4548,8 +4806,10 @@ class SupervisorEngine(
         steps are stored for the model only. What it writes elsewhere (a private chat, a
         group post, a notice) belongs to that conversation and is published as usual.
         """
-        active = self._runs.get(str(message["conversation_id"]))
-        if active is not None and active.background:
+        if any(
+            active.background and active.conversation_id == str(message["conversation_id"])
+            for active in self._runs.values()
+        ):
             return
         self._publish(event, models.message_payload(message))
 
@@ -4837,10 +5097,11 @@ class SupervisorEngine(
         self._settle_workflow(active, status, error)
         self._settle_group_tasks(active, status, error)
         self._settle_activities(active, status, error)
+        self._note_reply_context(active)
         if active.background:
             self._deliver_summary(active, status, error)
-        if self._runs.get(active.conversation_id) is active:
-            del self._runs[active.conversation_id]
+        if self._runs.get(active.run_id) is active:
+            del self._runs[active.run_id]
         self.computer.release(active.run_id)
         for callback in list(self._run_finished):
             try:
@@ -4854,6 +5115,53 @@ class SupervisorEngine(
             self.compact_after_run(active.conversation_id)
         if not active.background:
             self._pump_after(active.conversation_id)
+
+    def _note_reply_context(self, active: ActiveRun) -> None:
+        """A reply lane ended: tell every live work lane what the group just did.
+
+        This is background for the working turn, not a new requirement: it reaches the
+        model at its next call boundary with ``NOTE_CONTEXT_NOTE`` wording.
+        """
+        if active.lane != "reply" or active.background:
+            return
+        conversation = self._store.get_conversation(active.conversation_id)
+        if conversation is None:
+            return
+        trigger = (
+            self._store.get_message(active.trigger_message_id)
+            if active.trigger_message_id
+            else None
+        )
+        if trigger is None:
+            return
+        answer = ""
+        answerer = ""
+        for message in reversed(self._store.list_messages(conversation["id"])):
+            if (
+                message.get("run_id") == active.run_id
+                and message["kind"] == "agent"
+                and message.get("status") == "complete"
+                and str(message.get("content") or "").strip()
+            ):
+                answer = " ".join(str(message["content"]).split())[:120]
+                answerer = str(message.get("author_name") or "")
+                break
+        if not answer:
+            # A status card or a request note already said what the user's message did;
+            # there is no answer to summarise for the working lane.
+            return
+        asker = "用户" if trigger["kind"] == "user" else str(trigger.get("author_name") or "同事")
+        who = answerer or "有一路"
+        text = f"{asker}问了「{' '.join(str(trigger.get('content') or '').split())[:120]}」，{who}回答：「{answer}」。"
+        for activity in self._store.live_work_activities(conversation["id"]):
+            if str(activity.get("run_id") or "") == active.run_id:
+                continue
+            self.note_work_activity(
+                str(activity["id"]),
+                kind="context",
+                text=text,
+                source_message_id=str(trigger.get("id") or "") or None,
+            )
 
     def _settle_workflow(self, active: ActiveRun, status: str, error: str | None) -> None:
         """Record how this run ended on the walk it served, unless the walk said so itself.

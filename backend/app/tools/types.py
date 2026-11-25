@@ -73,6 +73,9 @@ class ToolOffer:
     # The supervisor is running a group's conversation, not doing hands-on work: tools that
     # execute on the machine (see ``ToolRegistry.EXECUTION_TOOL_NAMES``) stay out of reach.
     coordinating: bool = False
+    # A reply lane answers beside the work: only read-only tools (plus ``start_task`` and
+    # ``ask_user``) are offered, so answering a question never changes the workspace.
+    read_only: bool = False
     # This turn is already working a task's hidden thread: starting another task is not offered.
     from_thread: bool = False
 
@@ -133,6 +136,10 @@ class ToolRunContext:
     source_message_id: Callable[[], str | None] | None = None
     # ``run_subtasks``: this bot's own focused turns, side by side, reporting as they settle.
     run_subtasks: Callable[[list[dict], list[dict], Callable[[], None]], Awaitable[list[dict]]] | None = None
+    # Push one activity's refreshed payload (the progress board changed under a live card).
+    publish_activity: Callable[[str], None] | None = None
+    # The activity this tool call belongs to; the board is written on it.
+    activity_id: str | None = None
 
 
 @dataclass(frozen=True)

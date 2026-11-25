@@ -37,12 +37,12 @@ export function taskStatusMeta(status: TaskStatus, awaiting = false, waiting = f
 }
 
 /**
- * Why a queued task is still waiting: its own member's running task when there is one, else the
- * team-wide cap (no same-owner running task means the queue is global). Without the task list,
- * the quiet generic line is all we can honestly say.
+ * Why a queued task is still waiting: its own member's running task when there is one, the
+ * bot's live lane in this chat (the task row says whose), else the team-wide cap. Without the
+ * task list, the quiet generic line is all we can honestly say.
  */
 export function queuedWaitLine(
-  task: Pick<GroupTask, "id" | "owner_id">,
+  task: Pick<GroupTask, "id" | "owner_id" | "current_step">,
   tasks: readonly GroupTask[] | undefined,
   ownerName?: string,
 ): string {
@@ -50,8 +50,19 @@ export function queuedWaitLine(
     (row) => row.id !== task.id && row.owner_id === task.owner_id && row.status === "running",
   );
   if (running) return `等「${ownerName ?? "成员"}」做完「${running.title}」再开始`;
+  // The scheduler wrote why it waits when it queued the task behind a lane in this chat.
+  const step = task.current_step.trim();
+  if (step.startsWith("排队中，等")) return step;
   if (tasks) return "同时在做的任务满了，空出来就开始";
   return "等前面的任务做完再开始";
+}
+
+/**
+ * Whether the card still needs its own status word. A queued card whose reason already opens
+ * with 「排队中」 (it waits behind a live lane in this chat) says it once, in that line.
+ */
+export function showsStatusWord(status: TaskStatus, queuedLine: string): boolean {
+  return !(status === "queued" && queuedLine.startsWith("排队中"));
 }
 
 /** The one-line progress the card shows: steps so far and what it is doing now. */
@@ -256,13 +267,26 @@ export function taskOfThread(
 }
 
 /** One button the task card offers; each maps to a store call or a local view toggle. */
-export type TaskCardAction = "expand" | "thread" | "stop" | "cancel" | "merge" | "resume" | "dismiss";
+export type TaskCardAction =
+  | "expand"
+  | "thread"
+  | "stop"
+  | "cancel"
+  | "merge"
+  | "start"
+  | "resume"
+  | "dismiss";
 
-/** The buttons a card of this status shows, in the order they sit in its action row. */
-export function taskCardActions(status: TaskStatus): TaskCardAction[] {
+/**
+ * The buttons a card of this status shows, in the order they sit in its action row.
+ *
+ * ``direct`` is a card in the user's own chat with one bot: there the queued task waits for
+ * that bot's live lane, so it offers 「现在就做」; a group has no single bot to run beside.
+ */
+export function taskCardActions(status: TaskStatus, direct = false): TaskCardAction[] {
   switch (status) {
     case "queued":
-      return ["cancel", "merge"];
+      return direct ? ["start", "cancel"] : ["cancel", "merge"];
     case "running":
       return ["expand", "thread", "stop"];
     case "awaiting":

@@ -24,11 +24,11 @@ PERMISSION_SETTINGS_KEY = "permission_settings"
 DISPATCH_HEALTH_KEY = "dispatch_health"
 DISPATCH_HEALTH_LIMIT = 50
 
-SEND_MODES = ("steer", "queue", "interrupt")
+SEND_MODES = ("parallel", "queue", "interrupt")
 
 DEFAULT_TEAM_SETTINGS: dict[str, dict[str, Any]] = {
     # How a send meets a reply already running here, for every bot without its own override.
-    "send_mode": "steer",
+    "send_mode": "parallel",
     # How many model and tool calls one turn and one run may spend; see ``app.step_budget``.
     "step_budget": step_budget_rules.DEFAULT_PRESET,
     # A group's supervisor coordinates by default; this lets it do hands-on work there too.
@@ -172,6 +172,10 @@ class Team:
         # ``schedule_id`` is derived, never persisted.
         digest.pop("schedule_id", None)
         send_mode = data.get("send_mode")
+        # ``steer`` was the old default: a send joined the turn already running. It now runs
+        # a lane of its own beside that turn, which is what ``parallel`` names.
+        if send_mode == "steer":
+            send_mode = "parallel"
         if send_mode not in SEND_MODES:
             send_mode = DEFAULT_TEAM_SETTINGS["send_mode"]
         step_budget = data.get("step_budget")
@@ -215,7 +219,7 @@ class Team:
         """Merge partial settings, keep the digest schedule in step, and return the state."""
         current = self._stored_team_settings()
         if send_mode is not None:
-            current["send_mode"] = send_mode
+            current["send_mode"] = "parallel" if send_mode == "steer" else send_mode
         if step_budget is not None:
             current["step_budget"] = step_budget
         if supervisor_works_in_groups is not None:

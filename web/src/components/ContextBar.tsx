@@ -77,12 +77,12 @@ interface Outcome {
 
 export function ContextBar({
   conversationID,
-  run,
+  runs,
   busy,
 }: {
   conversationID: string;
-  /** The live run: a finished reply changes the request, so the bar re-reads it. */
-  run: Run | undefined;
+  /** Every live lane: a lane ending or starting changes what the next request carries. */
+  runs: Run[];
   /** True while a reply is streaming: compaction is refused then. */
   busy: boolean;
 }) {
@@ -139,7 +139,8 @@ export function ContextBar({
     }
   };
 
-  // A conversation change starts from nothing; a run's own end brings the next request.
+  // A conversation change starts from nothing; a lane starting or ending brings a new request.
+  const runsKey = runs.map((run) => `${run.id}:${run.status}`).join("|");
   useEffect(() => {
     setMeter(null);
     setOutcome(null);
@@ -152,7 +153,7 @@ export function ContextBar({
   useEffect(() => {
     void refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [run?.id, run?.status]);
+  }, [runsKey]);
 
   // The backend folds after a run and during a turn; its event is the bar's only clock.
   useEffect(() => {

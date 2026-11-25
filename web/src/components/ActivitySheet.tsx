@@ -17,9 +17,11 @@ import { errorMessage } from "../api/client";
 import {
   ACTIVITY_PILL,
   ACTIVITY_STATUS_META,
+  activityNoteLabel,
   activityStepLine,
   activityTime,
   isLiveActivity,
+  todoProgress,
 } from "../lib/activities";
 import { elapsedMs } from "../lib/taskProgress";
 import { momentStamp } from "../lib/time";
@@ -30,6 +32,7 @@ import { Dialog } from "./Dialog";
 import { Icon } from "./Icon";
 import { MessageAttachments } from "./Images";
 import { MessageBody } from "./MessageBody";
+import { TodoItemList } from "./TodoBoard";
 
 /** How long after an event the sheet re-reads: the stream already sends at most one a second. */
 const REFRESH_MS = 700;
@@ -145,6 +148,10 @@ export function ActivitySheet({
   const now = useSecondTick(ticking);
   const running = activity ? isLiveActivity(activity.status) : false;
   const answer = detail?.answer ?? null;
+  // The working lane's own board and what it heard from the group, as the sheet tells them.
+  const todos = activity?.todos ?? [];
+  const notes = detail?.notes ?? [];
+  const board = activity ? todoProgress(activity) : { done: 0, total: 0 };
 
   const memberNames = useMemo(() => agents.map((agent) => agent.name), [agents]);
 
@@ -263,6 +270,31 @@ export function ActivitySheet({
             <span className="activity-card-pulse" aria-hidden="true" />
             还在写，写完会出现在这里
           </p>
+        )}
+
+        {/* What the lane planned and what it heard while it worked: the board sits above the
+            timeline, so a progress question reads before every step. */}
+        {(todos.length > 0 || notes.length > 0) && (
+          <>
+            <hr className="activity-divider" />
+            <section className="activity-board" aria-label="进度">
+              <div className="activity-board-head">
+                <h3 className="activity-board-label">进度</h3>
+                {board.total > 0 && <span className="activity-board-count">{`${board.done}/${board.total} 项`}</span>}
+              </div>
+              {todos.length > 0 && <TodoItemList todos={todos} />}
+              {notes.length > 0 && (
+                <ul className="activity-notes">
+                  {notes.map((note, index) => (
+                    <li key={`${index}-${note.created_at}`} className={`activity-note ${note.kind}`}>
+                      <span className="activity-note-kind">{activityNoteLabel(note.kind)}</span>
+                      <span className="activity-note-text">{note.text}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          </>
         )}
 
         {detail && detail.sections.length > 0 && (

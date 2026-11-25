@@ -42,6 +42,7 @@ function run(patch: Partial<Run> = {}): Run {
     conversation_id: "c1",
     status: "running",
     current_step: "",
+    lane: "work",
     error: null,
     model_calls: 0,
     tool_calls: 0,

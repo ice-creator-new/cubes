@@ -234,7 +234,7 @@ class AgentOut(BaseModel):
     token_budget: TokenBudget | None = None
     tool_permissions: ToolPermissions | None = None
     # How a send meets this member mid-reply; ``None`` follows the team default.
-    send_mode: Literal["steer", "queue", "interrupt"] | None = None
+    send_mode: Literal["parallel", "queue", "interrupt"] | None = None
     # This bot's own approval mode; ``None`` follows the workspace.
     permission_mode: Literal["ask", "auto", "full"] | None = None
     created_at: str
@@ -385,6 +385,15 @@ class ActionDetailOut(BaseModel):
         return data
 
 
+class ActivityTodoOut(BaseModel):
+    """One item of a progress board, shared by an activity and a ``todo_write`` row."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    text: str
+    status: Literal["pending", "doing", "done", "dropped"] = "pending"
+
+
 class ActionOut(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -399,6 +408,9 @@ class ActionOut(BaseModel):
     error: str | None = None
     confirmation: ActionConfirmationOut | None = None
     detail: ActionDetailOut | None = None
+    # A ``todo_write`` call's board: its result when the call finished, else what it asked
+    # for. No other tool carries items, and the field stays out of their rows.
+    todos: list[ActivityTodoOut] | None = None
 
 
 class ApprovalRuleOut(BaseModel):
@@ -488,6 +500,16 @@ class RouteIntentOut(BaseModel):
     speakers: list[str] = Field(default_factory=list)
     task_id: str | None = None
     invite: list[str] = Field(default_factory=list)
+    # The live activity this slice changes (``steer`` with no task): the note goes to that
+    # working lane instead of starting a second answer.
+    affects: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _intent_shape(self, handler: Any) -> dict:
+        data = handler(self)
+        if data.get("affects") is None:
+            data.pop("affects", None)
+        return data
 
 
 class RouteOut(BaseModel):
@@ -503,6 +525,8 @@ class RouteOut(BaseModel):
     speakers: list[str] = Field(default_factory=list)
     kind: Literal["answer", "steer", "resume", "status", "invite", "none"] = "answer"
     task_id: str | None = None
+    # A ``steer`` about ongoing work names the live activity it changes.
+    affects: str | None = None
     reason: str = ""
     by: Literal["dispatcher", "fallback", "mention", "user"] = "dispatcher"
     # Still deciding: the hint reads 「正在决定谁来接」 and no speakers are known yet.
@@ -516,6 +540,8 @@ class RouteOut(BaseModel):
         data = handler(self)
         if not data.get("intents"):
             data.pop("intents", None)
+        if data.get("affects") is None:
+            data.pop("affects", None)
         return data
 
 
@@ -531,12 +557,28 @@ class StatusTaskOut(BaseModel):
     waiting_for: str | None = None
 
 
+class StatusActivityOut(BaseModel):
+    """One live lane's progress board, as a progress card reads it."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    activity_id: str
+    agent: str
+    title: str
+    current_step: str = ""
+    latest: str = ""
+    todos: list[ActivityTodoOut] = Field(default_factory=list)
+    todo_done: int = 0
+    todo_total: int = 0
+
+
 class StatusCardOut(BaseModel):
-    """One progress answer: every unfinished task of the group and who is idle."""
+    """One progress answer: every unfinished task and live activity, and who is idle."""
 
     model_config = ConfigDict(extra="ignore")
 
     tasks: list[StatusTaskOut] = Field(default_factory=list)
+    activities: list[StatusActivityOut] = Field(default_factory=list)
     idle: list[str] = Field(default_factory=list)
 
 
@@ -654,11 +696,24 @@ class RunOut(BaseModel):
     pending_agent_ids: list[str] = Field(default_factory=list)
     hops: int = 0
     schedule_id: str | None = None
+    # ``work`` runs the job itself; ``reply`` answers a new user message beside it.
+    lane: Literal["work", "reply"] = "work"
     # Some bot's turn in this run stopped at its step budget: 「继续」 picks up from there.
     wrapped: bool = False
     created_at: str
     updated_at: str
     finished_at: str | None = None
+
+
+class ActivityNoteOut(BaseModel):
+    """One note another lane left on this activity."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    kind: Literal["context", "request"]
+    text: str
+    source_message_id: str | None = None
+    created_at: str
 
 
 class ActivityOut(BaseModel):
@@ -686,6 +741,13 @@ class ActivityOut(BaseModel):
     steps: int = 0
     # The newest call's tool (``""`` before the first one): the card's icon matches its row's.
     current_tool: str = ""
+    # The progress board: the whole list in order, and its counts (dropped items count in
+    # ``todo_total`` but never in ``todo_done``).
+    todos: list[ActivityTodoOut] = Field(default_factory=list)
+    todo_done: int = 0
+    todo_total: int = 0
+    # ``work`` runs the job itself; ``reply`` answers beside a work lane.
+    lane: Literal["work", "reply"] = "work"
     started_at: str
     finished_at: str | None = None
     request_message_id: str | None = None
@@ -730,6 +792,7 @@ class ActivityDetailOut(BaseModel):
     activity: ActivityOut
     conversation_title: str = ""
     answer: MessageOut | None = None
+    notes: list[ActivityNoteOut] = Field(default_factory=list)
     sections: list[ActivitySectionOut] = Field(default_factory=list)
 
 
@@ -1276,7 +1339,7 @@ class AgentPatchRequest(BaseModel):
     # An object sets all four switches; ``null`` clears them (everything allowed).
     tool_permissions: ToolPermissions | None = None
     # How a send meets this bot mid-reply; ``null`` follows the team default.
-    send_mode: Literal["steer", "queue", "interrupt"] | None = None
+    send_mode: Literal["parallel", "queue", "interrupt"] | None = None
     # This bot's own approval mode; ``None`` follows the workspace.
     permission_mode: Literal["ask", "auto", "full"] | None = None
 
@@ -1532,9 +1595,9 @@ class TeamSettingsRequest(BaseModel):
 
     review: ReviewSettingsRequest | None = None
     digest: DigestSettingsRequest | None = None
-    # The workspace's answer for a send that meets a running reply: ``steer`` (default),
-    # ``queue`` or ``interrupt``.
-    send_mode: Literal["steer", "queue", "interrupt"] | None = None
+    # The workspace's answer for a send that meets a running reply: ``parallel`` (default:
+    # run a reply lane beside the work), ``queue`` or ``interrupt``.
+    send_mode: Literal["parallel", "queue", "interrupt"] | None = None
     # How many steps one turn and one run may take: ``unlimited`` (default), ``standard``,
     # ``long`` or ``marathon``; the resolved numbers ride back read-only on the response.
     step_budget: Literal["unlimited", "standard", "long", "marathon"] | None = None
@@ -1842,11 +1905,11 @@ class RunStartRequest(BaseModel):
     mentions: list[str] = Field(default_factory=list)
     reply_to_id: str | None = None
     attachment_ids: list[str] = Field(default_factory=list)
-    # What a send does while a reply is already running in this conversation: ``steer``
-    # (join the running turn), ``queue`` (send once it ends) or ``interrupt`` (stop it and
-    # answer this message instead). Omitted means the bot's own setting, else the team's
-    # default; scripts that want a fixed answer still pass it explicitly.
-    mode: Literal["steer", "queue", "interrupt"] | None = None
+    # What a send does while a reply is already running in this conversation: ``parallel``
+    # (run a reply lane beside the work), ``queue`` (send once it ends) or ``interrupt``
+    # (stop it and answer this message instead). Omitted means the bot's own setting, else
+    # the team's default; scripts that want a fixed answer still pass it explicitly.
+    mode: Literal["parallel", "queue", "interrupt"] | None = None
 
     @field_validator("content")
     @classmethod

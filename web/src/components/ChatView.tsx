@@ -16,6 +16,7 @@ import {
   visibleMessages,
   COMPUTER_TOOLS,
   computerSpans,
+  liveNote,
   quoteExcerpt,
   replyAnchor,
   replyText,
@@ -26,6 +27,7 @@ import {
   type TimelineRow,
 } from "../lib/turns";
 import { groupPlan, isLiveActivity } from "../lib/activities";
+import { boardTodos, isTodoBoard, planTodoBoards } from "../lib/todoBoard";
 import { taskByID, threadHeading } from "../lib/threads";
 import {
   elapsedMs,
@@ -34,6 +36,7 @@ import {
   isTaskDismissed,
   isTicking,
   queuedWaitLine,
+  showsStatusWord,
   taskCardActions,
   taskReasonLine,
   taskStatusMeta,
@@ -63,8 +66,10 @@ import { MessageBody } from "./MessageBody";
 import { openEmojiSheet, ReactionsRow } from "./Reactions";
 import { WorkflowPanel } from "./WorkflowPanel";
 import { GroupTasks } from "./GroupTasks";
+import { outOfOrderQuote } from "../lib/quotes";
 import { RouteHint } from "./RouteHint";
 import { StatusCardView } from "./StatusCardView";
+import { TodoBoardRow } from "./TodoBoard";
 import { RUN_LABELS, isLive, progress, stepLabel, stepOfMessage } from "../lib/workflow";
 
 import { TOOL_LABEL } from "../lib/toolLabels";
@@ -157,10 +162,22 @@ export function ChatView({
   }, [detail]);
   const conversation = workspace?.conversations.find((c) => c.id === conversationID) ?? detail?.conversation;
   const members = conversation ? membersOf(workspace, conversation) : [];
-  const run = workspace?.active_runs.find((r) => r.conversation_id === conversationID);
+  // A chat can hold several lanes at once: a bot working, another (or the same one) answering.
+  const runs = useMemo(
+    () => (workspace?.active_runs ?? []).filter((item) => item.conversation_id === conversationID),
+    [workspace, conversationID],
+  );
+  // The step line under the timeline follows the working lane; a reply lane writes its own rows.
+  const run = runs.find((item) => item.lane !== "reply") ?? runs[0];
   const isGroup = conversation?.kind === "group";
+  /** A direct chat may keep tasks too: a request the bot turned into its own thread. */
+  const isDirect = conversation?.kind === "direct";
   /** A task's own thread: hidden from the lists, opened from its group's card. */
   const isThread = conversation?.kind === "thread";
+  // The card draws its live state from the same task rows the group chip reads.
+  useEffect(() => {
+    if (isDirect) void store.loadGroupTasks(conversationID);
+  }, [conversationID, isDirect]);
   /** The group this thread belongs to, once the store has found it: its way back. */
   const threadGroup = isThread ? workspace?.conversations.find((c) => c.id === state.threadGroups[conversationID]) : undefined;
   useEffect(() => {
@@ -722,7 +739,7 @@ export function ChatView({
               arrivals={arrivals}
               canReply={!isPrivate}
               privateChat={isPrivate}
-              running={Boolean(run)}
+              running={runs.length > 0}
               step={run?.current_step ?? ""}
               stepTitle={(messageID) => {
                 const found = workflowRun ? stepOfMessage(workflowRun, messageID) : null;
@@ -867,7 +884,7 @@ export function ChatView({
             conversationID={conversationID}
             roster={roster}
             outside={outside}
-            run={run}
+            runs={runs}
             placeholder={placeholder}
             autoFocus
             fallbackAnswerer={fallbackAnswerer}
@@ -1149,6 +1166,27 @@ export function Timeline({
   );
   const messages = plan?.messages ?? detail.messages;
   const activities = state.activities;
+  // One turn's board writes fold into one row: the newest board, drawn where the turn's
+  // first plan was written, so it never jumps as later writes arrive.
+  const boards = useMemo(() => planTodoBoards(messages), [messages]);
+  const liveRuns = new Set(
+    (state.workspace?.active_runs ?? [])
+      .filter((run) => run.status === "running")
+      .map((run) => run.id),
+  );
+  /** The board one row draws, from the lane's live board or the newest write's items. */
+  const boardOf = (message: Message) => {
+    const newest = boards.shown.get(message.id);
+    if (newest === undefined) return null;
+    const activity = newest.activity_id ? activities[newest.activity_id] : undefined;
+    const live = activity
+      ? isLiveActivity(activity.status)
+      : newest.run_id !== null && liveRuns.has(newest.run_id);
+    const todos = live && activity?.todos?.length ? activity.todos : boardTodos(newest);
+    // A row from before boards carried their items keeps its plain sentence.
+    if (todos.length === 0) return null;
+    return { id: newest.id, todos, live };
+  };
   // A reload reads the rows before any event, so an activity the chat names is read on demand.
   useEffect(() => {
     for (const slot of plan?.slots ?? []) {
@@ -1170,6 +1208,8 @@ export function Timeline({
   }
   // Spacing, author lines and the single tools row of each reply.
   const rows = buildTimeline(messages, { privateChat, running });
+  // Where each row sits, for the one rule that needs to look back at the question answered.
+  const messageIndex = new Map(messages.map((message, index) => [message.id, index]));
   // Which finished replies left a memory behind, by the id of the message that wrote it.
   const memoryIndex = memoriesByMessage(state.memories?.memories ?? []);
   const spans = new Map(computerSpans(messages, { privateChat }).map((span) => [span.start, span]));
@@ -1293,6 +1333,7 @@ export function Timeline({
           <TaskCard
             message={message}
             conversationID={detail.conversation.id}
+            direct={detail.conversation.kind === "direct"}
             onOpenConversation={onOpenConversation}
             onOpenMember={onOpenMember}
             onMention={onMention}
@@ -1303,7 +1344,16 @@ export function Timeline({
       );
     }
     if (message.kind === "action") {
-      const row = (
+      const board = boardOf(message);
+      const row = board ? (
+        <TodoBoardRow
+          key={message.id}
+          id={board.id}
+          todos={board.todos}
+          live={board.live}
+          continues={continues}
+        />
+      ) : (
         <ActionRow
           key={message.id}
           message={message}
@@ -1340,11 +1390,22 @@ export function Timeline({
       );
     }
     const agent = workspaceAgents.find((a) => a.id === message.author_id);
-    const parent = message.reply_to_id ? byID[message.reply_to_id] : undefined;
-    const replyTo = parent ? (parent.kind === "user" ? "你" : `@${parent.author_name}`) : undefined;
+    // An answer that reached an older question is named here; the activity's request is the
+    // fallback for a row that carries no ``reply_to_id`` of its own.
+    const chipIDs = chipsAt.get(message.id) ?? [];
+    const questionID =
+      message.reply_to_id ??
+      (chipIDs.length > 0 ? activities[chipIDs[0]!]?.request_message_id ?? null : null);
+    const quote = outOfOrderQuote(
+      messages,
+      messageIndex.get(message.id) ?? -1,
+      questionID,
+    );
     const mood = agent ? moodFor(state, agent.id, message.conversation_id) : "idle";
     // Live state belongs to the burst, not the row: it shows on the one author line above.
-    const note = liveNote(live, step, message.author_name) ?? (!continues && replyTo ? `回复 ${replyTo}` : undefined);
+    // The question an answer belongs to is the bubble's quote (out of order only), never a
+    // short 「回复 你」 note here.
+    const note = liveNote(live, step, message.author_name);
     const text = tools ? replyText(detail.messages, message.id, { privateChat }) : "";
     const memoryWritten = memoryIndex.get(message.id);
     return (
@@ -1399,6 +1460,16 @@ export function Timeline({
         <div className="bubble-stack">
           {(message.content !== "" || message.status !== "streaming" || (message.attachments?.length ?? 0) > 0) && (
             <div className={head ? "bubble reply head" : "bubble reply"}>
+              {quote && (
+                <button
+                  type="button"
+                  className="bubble-quote"
+                  onClick={() => onJump(quote.id)}
+                  aria-label={`查看被回复的消息，来自${quote.label}`}
+                >
+                  回复 {quote.label}：{quote.excerpt}
+                </button>
+              )}
               {/* An empty reply that has just opened: its avatar above is already thinking. */}
               {(message.content !== "" || message.status !== "streaming") && (
                 <MessageBody
@@ -1488,6 +1559,8 @@ export function Timeline({
     if (entry.message.kind !== "action" || action === null) return false;
     if (action.status === "awaiting" || action.tool_name === "direct_message") return false;
     if (COMPUTER_TOOLS.has(action.tool_name)) return false;
+    // The board keeps its own row: its expanded list is not a line inside a shared frame.
+    if (isTodoBoard(entry.message)) return false;
     return !(action.tool_name === "workflow_run" && action.target_conversation_id !== null);
   };
   /** A live card, or a finished one that left no answer, stands where its rows would have been. */
@@ -1511,6 +1584,8 @@ export function Timeline({
           fallbackSeed={owner?.avatar_seed}
           showAuthor={!continues}
           onOpen={openActivity}
+          quote={outOfOrderQuote(messages, at, activity?.request_message_id)}
+          onJumpQuote={onJump}
         />,
       );
     }
@@ -1519,6 +1594,8 @@ export function Timeline({
     const span = spans.get(index);
     const row = rows[index]!;
     pushActivitySlots(index);
+    // An older board of this turn: the newest write is drawn on the turn's first board row.
+    if (boards.hidden.has(row.message.id)) continue;
     if (swallowed.has(index)) continue;
     if (row.showAuthor) tailWaiting = true;
     const head = tailWaiting && bubbleShown(row);
@@ -1647,6 +1724,7 @@ const NO_IDS = new Set<string>();
 function TaskCard({
   message,
   conversationID,
+  direct,
   onOpenConversation,
   onOpenMember,
   onMention,
@@ -1655,6 +1733,8 @@ function TaskCard({
 }: {
   message: Message;
   conversationID: string;
+  /** The user's own chat with one bot: a queued card may start right away. */
+  direct: boolean;
   onOpenConversation: (id: string) => void;
   onOpenMember: (id: string) => void;
   onMention: (name: string) => void;
@@ -1676,7 +1756,7 @@ function TaskCard({
   const archived = task ? isTaskArchived(task) : false;
   const dismissed = task ? isTaskDismissed(task) : false;
   const closed = archived || dismissed;
-  const actions = closed ? [] : taskCardActions(status);
+  const actions = closed ? [] : taskCardActions(status, direct);
   const reason = task ? taskReasonLine(task) : "";
   const waitingFor = (task?.waiting_for ?? "").trim();
   const meta = taskStatusMeta(status, awaiting, waitingFor !== "");
@@ -1766,12 +1846,14 @@ function TaskCard({
           endedAt={task?.updated_at ?? null}
           ticking={isTicking(status) || awaiting}
         />
-        <span className={`task-card-status ${meta.tone}`}>
-          {(meta.tone === "running" || meta.tone === "awaiting") && (
-            <span className="task-card-dot" aria-hidden="true" />
-          )}
-          {meta.label}
-        </span>
+        {showsStatusWord(status, queuedLine) && (
+          <span className={`task-card-status ${meta.tone}`}>
+            {(meta.tone === "running" || meta.tone === "awaiting") && (
+              <span className="task-card-dot" aria-hidden="true" />
+            )}
+            {meta.label}
+          </span>
+        )}
       </div>
 
       {/* A queued card says once why it waits; the fixed two-line box belongs to live work. */}
@@ -1861,10 +1943,21 @@ function TaskCard({
               停止
             </button>
           )}
+          {actions.includes("start") && task && (
+            <button
+              type="button"
+              className="ghost-button task-card-action task-card-now"
+              disabled={pending}
+              title="不用等这个成员手上的活，另一路同时开始"
+              onClick={() => void control(() => store.startTaskNow(conversationID, task.id))}
+            >
+              现在就做
+            </button>
+          )}
           {actions.includes("cancel") && task && (
             <button
               type="button"
-              className="ghost-button task-card-action"
+              className="ghost-button task-card-action task-card-quiet"
               disabled={pending}
               onClick={() => void control(() => store.stopTask(conversationID, task.id))}
             >
@@ -2163,21 +2256,6 @@ function StepCard({ step, number, said }: { step: Message; number: number; said:
 
 function liveMood(live: BurstState | null): Mood | null {
   return live === "interrupted" ? "error" : live;
-}
-
-/** The waiting steps the backend reports while a model call shows nothing yet. */
-const WAITING_STEP = /^正在(思考|等模型回复)|没有回应/;
-/** A run parked on the user (a card, a question): the bot is not replying, it is waiting. */
-const USER_STEP = /^等(待)?你/;
-
-function liveNote(live: BurstState | null, step: string, author: string): string | undefined {
-  if (live === "interrupted") return "已停止";
-  if (!live) return undefined;
-  if (USER_STEP.test(step)) return step;
-  // The run names the bot it waits on; the author line already does, so only the rest shows.
-  const prefix = `「${author}」`;
-  const waiting = step.startsWith(prefix) ? step.slice(prefix.length).replace(/^的/, "") : "";
-  return WAITING_STEP.test(waiting) || USER_STEP.test(waiting) ? waiting : "正在回复";
 }
 
 /** Fade the top edge only while something is hidden past it. The bottom needs no fade: the

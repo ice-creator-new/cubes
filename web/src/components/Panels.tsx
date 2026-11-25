@@ -291,7 +291,7 @@ function MemberEditorForm({
   const providers = useTeam((s) => s.providers);
   const usage = useTeam((s) => s.usage);
   const skills = useTeam((s) => s.skills);
-  const teamMode = useTeam((s) => s.teamSettings?.send_mode) ?? "steer";
+  const teamMode = useTeam((s) => s.teamSettings?.send_mode) ?? "parallel";
   const teamPermissionMode = useTeam((s) => s.permissionSettings?.mode) ?? "ask";
   const agent = agentByID(workspace, agentID);
   const [name, setName] = useState(agent?.name ?? "");
@@ -746,7 +746,7 @@ function MemberEditorForm({
                 </div>
                 <p className="hint">
                   {sendMode === null
-                    ? `跟随团队设置：现在是「${SEND_MODES.find((option) => option.id === teamMode)?.label ?? "插进这一轮"}」。`
+                    ? `跟随团队设置：现在是「${SEND_MODES.find((option) => option.id === teamMode)?.label ?? "并行（不打断）"}」。`
                     : SEND_MODES.find((option) => option.id === sendMode)?.hint}
                 </p>
               </section>

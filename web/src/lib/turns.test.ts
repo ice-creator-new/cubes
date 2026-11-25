@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Message } from "../api/types";
 import type { TimelineRow } from "./turns";
-import { buildTimeline, commentaryBlocks, computerSpans, quoteExcerpt, replyText } from "./turns";
+import { buildTimeline, commentaryBlocks, computerSpans, liveNote, quoteExcerpt, replyText } from "./turns";
 
 let seq = 0;
 
@@ -481,5 +481,20 @@ describe("commentary merge", () => {
     const rows = layout(first, card, second, conclusion);
     expect(commentaryBlocks(rows)).toHaveLength(0);
     expect(rows[at(rows, card.id)]!.message.kind).toBe("task");
+  });
+});
+
+describe("the author line's live note", () => {
+  it("keeps the live step notes a burst shows while it works", () => {
+    expect(liveNote("speaking", "", "小北")).toBe("正在回复");
+    expect(liveNote("speaking", "「小北」正在思考（12 秒）", "小北")).toBe("正在思考（12 秒）");
+    expect(liveNote("speaking", "「小北」正在等模型回复（8 秒）", "小北")).toBe("正在等模型回复（8 秒）");
+    expect(liveNote("speaking", "等你确认", "小北")).toBe("等你确认");
+    expect(liveNote("interrupted", "正在思考", "小北")).toBe("已停止");
+  });
+
+  it("says nothing for a settled reply, and never names who it replies to", () => {
+    expect(liveNote(null, "", "小北")).toBeUndefined();
+    expect(liveNote(null, "「小北」正在思考（3 秒）", "小北")).toBeUndefined();
   });
 });

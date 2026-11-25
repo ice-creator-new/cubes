@@ -18,6 +18,7 @@ from .text import (
     MEMBER_DIRECT_SYSTEM,
     MEMBER_PRIVATE_SYSTEM,
     MEMBER_SYSTEM,
+    MEMBER_THREAD_DIRECT_SYSTEM,
     MEMBER_THREAD_SYSTEM,
     MEMORY_EXTRACT_SYSTEM,
     MEMORY_MORE,
@@ -390,30 +391,30 @@ def transfer_instruction(task: str, giver: str, note: str = "") -> str:
     )
 
 
-def thread_task_instruction(request: str, title: str) -> str:
-    """The first turn of a task thread: what the group asked for, and what ends it.
+def thread_task_instruction(request: str, title: str, *, where: str = "群里") -> str:
+    """The first turn of a task thread: what the chat asked for, and what ends it.
 
     Only used while the thread is still empty; every later turn reads its own history.
     """
     return (
-        f"群里交给你的任务：「{title}」\n用户的原话：{request}\n\n"
-        "现在开始做。可以先查资料、改文件、跑命令；做完给出要发到群里的那条结论。"
+        f"{where}交给你的任务：「{title}」\n用户的原话：{request}\n\n"
+        f"现在开始做。可以先查资料、改文件、跑命令；做完给出要发到{where}的那条结论。"
     )
 
 
-def thread_work_instruction(title: str, content: str) -> str:
+def thread_work_instruction(title: str, content: str, *, where: str = "群里") -> str:
     """The first turn of a thread opened by a user's message: what was said, and what ends it.
 
     ``content`` is the message as the model reads it (:func:`app.agent.history.user_turn_content`),
     so a reply keeps the quote of the message it answers.
     """
     return (
-        f"群里交给你的任务：「{title}」。这条是源头：\n\n{content}\n\n"
-        "现在开始做。可以先查资料、改文件、跑命令；做完给出要发到群里的那条结论。"
+        f"{where}交给你的任务：「{title}」。这条是源头：\n\n{content}\n\n"
+        f"现在开始做。可以先查资料、改文件、跑命令；做完给出要发到{where}的那条结论。"
     )
 
 
-def thread_group_view(title: str, recent: Sequence[str]) -> str:
+def thread_group_view(title: str, recent: Sequence[str], *, direct: bool = False) -> str:
     """The compact view of the group a task thread belongs to: what was just said there.
 
     It rides with the turn's live hints (never the system prompt), so it can change with
@@ -421,7 +422,8 @@ def thread_group_view(title: str, recent: Sequence[str]) -> str:
     """
     if not recent:
         return ""
-    lines = [f"<group_view>", f"「{title}」群里最近的话（你不必回复这些）："]
+    place = "用户那个聊天" if direct else f"「{title}」群"
+    lines = ["<group_view>", f"{place}里最近的话（你不必回复这些）："]
     lines.extend(recent)
     lines.append("</group_view>")
     return "\n".join(lines)
@@ -603,6 +605,7 @@ def member_system(
     skills: str = "",
     workflow: str = "",
     hints: Sequence[str] = (),
+    thread_surface: str = "group",
 ) -> str:
     """A member's system prompt for one conversation kind, the mood rule last.
 
@@ -620,6 +623,10 @@ def member_system(
     elif conversation_kind == "private":
         system = MEMBER_PRIVATE_SYSTEM.format(
             name=name, instructions=instructions, peer=peer or "另一位成员"
+        )
+    elif conversation_kind == "thread" and thread_surface == "direct":
+        system = MEMBER_THREAD_DIRECT_SYSTEM.format(
+            name=name, instructions=instructions, purpose=purpose
         )
     elif conversation_kind == "thread":
         system = MEMBER_THREAD_SYSTEM.format(

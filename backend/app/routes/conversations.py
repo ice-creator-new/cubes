@@ -10,7 +10,7 @@ from .. import models, providers
 from ..agent.context import speaker_for
 from ..agent.run_state import RunLauncher, resolve_send_mode
 from ..engine import SupervisorEngine
-from ..errors import EngineBusy, GroupDissolveRefused, UpstreamError
+from ..errors import EngineBusy, GroupDissolveRefused, TaskBusy, UpstreamError
 from ..mentions import opening_mentions, parse_mentions
 from ..models import (
     ConversationPatchRequest,
@@ -287,12 +287,9 @@ async def start_run(
         ):
             mentions.append(quoted_author)
     addresses = addressed_ids(roster, payload.content, list(payload.mentions), quoted_author)
-    # What the send does when it meets a running reply: an explicit choice from an API
+    # What the send does when it meets a running lane: an explicit choice from an API
     # caller wins; otherwise the bot it will meet decides, falling back to the team setting.
-    # Images cannot join a request already on the wire, so such a send waits instead.
     mode = payload.mode or resolve_send_mode(store, conversation, store.active_run(conversation_id))
-    if mode == "steer" and payload.attachment_ids:
-        mode = "queue"
     run = await launcher.launch(
         conversation,
         content=payload.content,
@@ -549,10 +546,14 @@ async def invite_member(
 
 @router.get("/conversations/{conversation_id}/tasks")
 async def list_group_tasks(conversation_id: str, store: Store = Depends(get_store)) -> dict:
-    """The work this group took on, newest first: who owns it, how it stands, its parts."""
+    """The work this chat took on, newest first: who owns it, how it stands, its parts.
+
+    Direct chats keep tasks too (a request the bot turned into its own thread); a thread
+    itself has no tasks of its own and is refused like any other non-chat.
+    """
     conversation = store.get_conversation(conversation_id)
-    if conversation is None or conversation["kind"] != "group":
-        raise HTTPException(status_code=404, detail="群组不存在。")
+    if conversation is None or conversation["kind"] not in ("group", "direct"):
+        raise HTTPException(status_code=404, detail="聊天不存在。")
     return {"conversation_id": conversation_id, "tasks": store.group_tasks_payload(conversation_id)}
 
 
@@ -567,6 +568,22 @@ async def merge_group_task(
     if merged is None:
         raise HTTPException(status_code=409, detail="这个任务不在排队，或它没有正在做的任务可以合并。")
     return merged
+
+
+@router.post("/conversations/{conversation_id}/tasks/{task_id}/now")
+async def start_group_task_now(
+    conversation_id: str,
+    task_id: str,
+    task_scheduler: TaskScheduler = Depends(get_task_scheduler),
+) -> dict:
+    """「现在就做」: start a queued task beside its owner's live work, without waiting."""
+    try:
+        started = await task_scheduler.start_now(conversation_id, task_id)
+    except TaskBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if started is None:
+        raise HTTPException(status_code=404, detail="这个聊天里没有这个任务。")
+    return started
 
 
 @router.post("/conversations/{conversation_id}/tasks/{task_id}/stop")

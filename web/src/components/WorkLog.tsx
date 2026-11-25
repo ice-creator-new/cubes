@@ -9,6 +9,7 @@ import {
   activityGlyph,
   groupActivitiesByDay,
   isLiveActivity,
+  todoProgress,
   type ActivityGlyph,
 } from "../lib/activities";
 import { clockTime } from "../lib/time";
@@ -165,6 +166,7 @@ export function WorkLog({
                   const current = activities[activity.id] ?? activity;
                   const meta = ACTIVITY_STATUS_META[current.status];
                   const glyph = activityGlyph(current);
+                  const board = todoProgress(current);
                   return (
                     <li key={current.id}>
                       <button
@@ -185,6 +187,7 @@ export function WorkLog({
                           <span className="work-log-row-time">
                             {clockTime(current.started_at)}
                             {isLiveActivity(current.status) && " · 进行中"}
+                            {board.total > 0 && ` · ${board.done}/${board.total} 项`}
                           </span>
                         </span>
                       </button>

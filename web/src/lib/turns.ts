@@ -452,3 +452,22 @@ export function replyText(
 ): string {
   return replyAnchor(messages, messageID, options)?.text ?? "";
 }
+
+/** The waiting steps the backend reports while a model call shows nothing yet. */
+export const WAITING_STEP = /^正在(思考|等模型回复)|没有回应/;
+/** A run parked on the user (a card, a question): the bot is not replying, it is waiting. */
+export const USER_STEP = /^等(待)?你/;
+
+/**
+ * What the author line says while this burst is live. Only live state belongs here: an answer's
+ * question is named by the bubble's own quote when it is out of order, never as 「回复 你」.
+ */
+export function liveNote(live: BurstState | null, step: string, author: string): string | undefined {
+  if (live === "interrupted") return "已停止";
+  if (!live) return undefined;
+  if (USER_STEP.test(step)) return step;
+  // The run names the bot it waits on; the author line already does, so only the rest shows.
+  const prefix = `「${author}」`;
+  const waiting = step.startsWith(prefix) ? step.slice(prefix.length).replace(/^的/, "") : "";
+  return WAITING_STEP.test(waiting) || USER_STEP.test(waiting) ? waiting : "正在回复";
+}

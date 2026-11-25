@@ -789,10 +789,8 @@ def test_a_resume_the_cli_cannot_find_falls_back_to_the_full_history(
 def test_a_steer_to_a_cli_bot_waits_instead(
     make_backend, fake_cli: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A CLI drives its own session: there is no mid-turn seam, so the send queues.
-
-    The team default is 插进这一轮 here, so only the engine's own limit can turn it into a
-    queued send.
+    """A CLI drives its own session: a second session would race it, and no HTTP backup
+    model is configured here, so the parallel send queues instead.
     """
     monkeypatch.setenv("FAKE_CLI_MODE", "slow")
     monkeypatch.setenv("FAKE_PID_FILE", str(tmp_path / "engine-pid"))

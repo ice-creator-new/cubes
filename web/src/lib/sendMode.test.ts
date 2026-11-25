@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { Message, SendMode } from "../api/types";
+import type { Message, Run, SendMode } from "../api/types";
 import {
-  busyPlaceholder,
+  laneLabel,
   queuedMessages,
   resolveSendMode,
   SEND_MODES,
+  stopChoices,
   withoutQueued,
 } from "./sendMode";
 
@@ -30,44 +31,69 @@ function message(id: string, patch: Partial<Message> = {}): Message {
   };
 }
 
+function run(id: string, lane: Run["lane"], agent: string | null = "a1"): Run {
+  return {
+    id,
+    conversation_id: "c_1",
+    status: "running",
+    lane,
+    current_step: "",
+    error: null,
+    model_calls: 0,
+    tool_calls: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cached_tokens: 0,
+    created_at: "2026-11-20T00:00:00Z",
+    updated_at: "2026-11-20T00:00:00Z",
+    finished_at: null,
+    current_agent_id: agent,
+    pending_agent_ids: [],
+    hops: 0,
+  };
+}
+
 describe("the mode a send carries", () => {
   it("follows the team setting when the bot has no pick of its own", () => {
-    expect(resolveSendMode(null, "steer", false)).toBe("steer");
-    expect(resolveSendMode(undefined, "queue", false)).toBe("queue");
-    expect(resolveSendMode(null, "interrupt", false)).toBe("interrupt");
+    expect(resolveSendMode(null, "parallel")).toBe("parallel");
+    expect(resolveSendMode(undefined, "queue")).toBe("queue");
+    expect(resolveSendMode(null, "interrupt")).toBe("interrupt");
   });
 
   it("lets the bot's own pick win over the team setting", () => {
-    expect(resolveSendMode("queue", "steer", false)).toBe("queue");
-    expect(resolveSendMode("steer", "queue", false)).toBe("steer");
-    expect(resolveSendMode("interrupt", "queue", false)).toBe("interrupt");
-  });
-
-  it("queues a steer to a CLI bot, which cannot take a message mid-turn", () => {
-    expect(resolveSendMode("steer", "queue", true)).toBe("queue");
-    expect(resolveSendMode(null, "steer", true)).toBe("queue");
-  });
-
-  it("queues a steer that carries images", () => {
-    expect(resolveSendMode("steer", "steer", false, true)).toBe("queue");
-    // The other modes are unaffected by images, which only matter to a steer.
-    expect(resolveSendMode("queue", "steer", false, true)).toBe("queue");
-    expect(resolveSendMode("interrupt", "steer", false, true)).toBe("interrupt");
-  });
-});
-
-describe("the empty field's prompt", () => {
-  it("names what a send would do", () => {
-    expect(busyPlaceholder("steer")).toContain("这一轮");
-    expect(busyPlaceholder("queue")).toContain("排队");
-    expect(busyPlaceholder("interrupt")).toContain("打断");
+    expect(resolveSendMode("queue", "parallel")).toBe("queue");
+    expect(resolveSendMode("interrupt", "queue")).toBe("interrupt");
+    expect(resolveSendMode("parallel", "interrupt")).toBe("parallel");
   });
 });
 
 describe("the three settings", () => {
-  it("offers every mode once", () => {
-    expect(SEND_MODES.map((option) => option.id)).toEqual<SendMode[]>(["steer", "queue", "interrupt"]);
+  it("offers every mode once, parallel first", () => {
+    expect(SEND_MODES.map((option) => option.id)).toEqual<SendMode[]>(["parallel", "queue", "interrupt"]);
+    expect(SEND_MODES[0]?.label).toContain("并行");
     for (const option of SEND_MODES) expect(option.hint.length).toBeGreaterThan(0);
+  });
+});
+
+describe("stopping one lane", () => {
+  const nameOf = (item: Run) => (item.id === "r2" ? "主簿" : "匠师");
+
+  it("stops the only lane directly, without a menu", () => {
+    expect(stopChoices([run("r1", "work")], nameOf)).toEqual([{ id: "r1", label: "停下 匠师（干活）" }]);
+  });
+
+  it("names each lane when a bot works and answers at once, then all of them", () => {
+    const choices = stopChoices([run("r1", "work"), run("r2", "reply")], nameOf);
+    expect(choices).toEqual([
+      { id: "r1", label: "停下 匠师（干活）" },
+      { id: "r2", label: "停下 主簿（回答）" },
+      { id: "", label: "全部停下" },
+    ]);
+  });
+
+  it("reads the two lanes in the user's words", () => {
+    expect(laneLabel("work")).toBe("干活");
+    expect(laneLabel("reply")).toBe("回答");
   });
 });
 

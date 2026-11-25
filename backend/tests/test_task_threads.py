@@ -11,6 +11,7 @@ from helpers import (
     agent_messages,
     client_for,
     get_conversation,
+    get_run,
     get_workspace,
     last_user_text,
     payloads,
@@ -83,10 +84,10 @@ def cards(detail: dict) -> list[dict]:
 
 
 def in_thread(request: dict) -> bool:
-    """Whether one fake request is a thread turn rather than a group turn."""
+    """Whether one fake request is a thread turn rather than a chat turn."""
     messages = request.get("messages") or []
     system = str((messages[0] if messages else {}).get("content") or "")
-    return "群组里做一件活" in system
+    return "做一件活" in system
 
 
 def responder(group_reply, thread_reply):
@@ -285,12 +286,12 @@ def test_merge_folds_a_queued_task_into_the_running_thread(make_backend, upstrea
             assert merged.status_code == 200, merged.text
             assert merged.json()["status"] == "done"
             assert merged.json()["current_step"].startswith("已并入")
-            # The running thread received the folded request as a steer.
-            thread = await get_conversation(client, running["thread_id"])
-            assert "排队的" in " ".join(
-                m["content"] for m in thread["messages"] if m["kind"] == "user"
-            )
+            # The running thread received the folded request as a request note.
             await wait_for_run(client, running["run_id"], timeout=15)
+            assert any(
+                "排队的" in last_user_text(request)
+                for request in upstream.requests
+            )
 
     asyncio.run(body())
 
@@ -471,5 +472,227 @@ def test_the_team_setting_controls_the_parallel_cap(make_backend) -> None:
             assert too_many.status_code == 422
             too_few = await client.patch("/settings/team", json={"max_parallel_tasks": 0})
             assert too_few.status_code == 422
+
+    asyncio.run(body())
+
+
+# ------------------------------------------------------------------ direct chats
+
+
+def _todo(*items: dict) -> dict:
+    return {"items": items}
+
+
+def _streams_slowly(text: str, seconds: float = 8.0) -> dict:
+    return {
+        "content": text * 8,
+        "chunk_count": len(text) * 8,
+        "chunk_delay": seconds / (len(text) * 8),
+    }
+
+
+def _direct_spec(counter: dict):
+    """One direct chat's script: the work lane, two reply lanes, and the task's thread."""
+
+    def spec(requests, index):
+        request = requests[index - 1]
+        text = last_user_text(request)
+        if in_thread(request):
+            return {"content": "第二件做完了"}
+        if "现在进度如何" in text:
+            return {"content": "进度：数据收好了，正在写结论。"}
+        if "再做第二件" in text:
+            return start_task("做第二件", "先收集再动手")
+        counter["work"] = counter.get("work", 0) + 1
+        if counter["work"] == 1:
+            return tool_calls(
+                call("call_todo", "todo_write", _todo({"text": "收集数据", "status": "doing"}))
+            ) | {"content": "先列计划。"}
+        return _streams_slowly("正在慢慢做第一件。", 20)
+
+    return spec
+
+
+def test_a_direct_chat_answers_progress_and_queues_new_work(make_backend, upstream) -> None:
+    """The reply lane answers a progress question at once; real work waits, or runs now."""
+    backend = make_backend()
+    store = store_of(backend)
+    counter: dict = {}
+    upstream.script = [_direct_spec(counter)]
+
+    async def body() -> None:
+        async with client_for(backend) as client:
+            chat = (await get_workspace(client))["direct_conversation_id"]
+            work = await start_run(client, chat, "做一份报告")
+            await wait_for_message(client, chat, status="streaming", kind="agent")
+            supervisor = store.supervisor()
+
+            # A progress question runs beside the work lane and answers from its board.
+            asked = await client.post(
+                f"/conversations/{chat}/runs", json={"content": "现在进度如何？"}
+            )
+            assert asked.status_code == 202, asked.text
+            assert asked.json()["lane"] == "reply"
+            answered = await wait_for_run(client, asked.json()["id"], timeout=10)
+            assert answered["status"] == "completed", answered
+            assert (await get_run(client, work["id"]))["status"] == "running"
+            reply_request = next(
+                request
+                for request in upstream.requests
+                if "现在进度如何" in last_user_text(request)
+            )
+            system = system_prompt(reply_request)
+            assert "你另一路正在做" in system
+            assert "收集数据" in system
+
+            # Real new work opens a task in this chat, queued behind the live work lane.
+            second = await client.post(
+                f"/conversations/{chat}/runs", json={"content": "再做第二件"}
+            )
+            assert second.status_code == 202, second.text
+            assert second.json()["lane"] == "reply"
+            await wait_for_run(client, second.json()["id"], timeout=10)
+            queued = await wait_for_task(client, chat, status="queued")
+            assert queued["owner_id"] == supervisor["id"]
+            assert queued["thread_id"]
+            # The bot it waits behind is the one still answering here: no name, just the lane.
+            assert queued["current_step"] == "排队中，等这一轮回复结束"
+            detail = await get_conversation(client, chat)
+            [card] = cards(detail)
+            assert card["task_id"] == queued["id"]
+            assert card["author_name"] == supervisor["name"]
+            assert card["content"] == "做第二件"
+            # The reply lane ending is not enough: the work lane still holds the queue.
+            await asyncio.sleep(0.3)
+            assert (await get_run(client, work["id"]))["status"] == "running"
+            still = next(t for t in await tasks_of(client, chat) if t["id"] == queued["id"])
+            assert still["status"] == "queued"
+
+            # 「现在就做」 starts it beside the work lane, as a second work lane for the bot.
+            now = await client.post(f"/conversations/{chat}/tasks/{queued['id']}/now")
+            assert now.status_code == 200, now.text
+            started = now.json()
+            assert started["status"] == "running"
+            assert started["run_id"]
+            assert (await get_run(client, work["id"]))["status"] == "running"
+
+            done = await wait_for_task(client, chat, status="done")
+            assert done["id"] == queued["id"]
+            detail = await get_conversation(client, chat)
+            results = [
+                message
+                for message in detail["messages"]
+                if message["kind"] == "agent" and message["content"] == "第二件做完了"
+            ]
+            assert len(results) == 1
+
+            await client.post(f"/runs/{work['id']}/stop", json={})
+
+    asyncio.run(body())
+
+
+def test_a_supervisor_hands_direct_chat_work_to_a_member(make_backend, upstream) -> None:
+    """A direct chat's supervisor names an owner, so the task starts beside its own lane."""
+    backend = make_backend()
+    store = store_of(backend)
+    member = store.create_agent(name="甲", instructions="做东西", kind="member")
+    counter: dict = {}
+
+    def spec(requests, index):
+        request = requests[index - 1]
+        text = last_user_text(request)
+        if in_thread(request):
+            # Long enough to observe: the member works while the supervisor's lane still runs.
+            return _streams_slowly("甲做完了", 3)
+        if "交给甲" in text:
+            return tool_calls(
+                call(
+                    "call_handoff",
+                    "start_task",
+                    {"title": "写一份说明", "owner": "甲", "plan": "先读代码"},
+                )
+            ) | {"content": "我让甲来做。"}
+        counter["work"] = counter.get("work", 0) + 1
+        if counter["work"] == 1:
+            return tool_calls(
+                call("call_todo", "todo_write", _todo({"text": "整理资料", "status": "doing"}))
+            ) | {"content": "我先整理一下。"}
+        return _streams_slowly("主管自己在慢慢整理资料。", 20)
+
+    upstream.script = [spec]
+
+    async def body() -> None:
+        async with client_for(backend) as client:
+            chat = (await get_workspace(client))["direct_conversation_id"]
+            work = await start_run(client, chat, "整理资料")
+            await wait_for_message(client, chat, status="streaming", kind="agent")
+            sent = await client.post(
+                f"/conversations/{chat}/runs", json={"content": "这件事交给甲去做"}
+            )
+            assert sent.status_code == 202, sent.text
+            await wait_for_run(client, sent.json()["id"], timeout=10)
+            task = await wait_for_task(client, chat, status="running")
+            # Handed to another member: it runs in that member's own thread, not behind the
+            # supervisor's lane, and the card carries the member's name in the direct chat.
+            assert task["owner_id"] == member["id"]
+            assert (await get_run(client, work["id"]))["status"] == "running"
+            detail = await get_conversation(client, chat)
+            [card] = cards(detail)
+            assert card["author_name"] == "甲"
+            thread = await get_conversation(client, task["thread_id"])
+            assert thread["conversation"]["member_ids"] == [member["id"]]
+
+            done = await wait_for_task(client, chat, status="done")
+            assert done["id"] == task["id"]
+            detail = await get_conversation(client, chat)
+            assert any(
+                message["kind"] == "agent"
+                and message["author_name"] == "甲"
+                and "甲做完了" in message["content"]
+                for message in detail["messages"]
+            )
+            await client.post(f"/runs/{work['id']}/stop", json={})
+
+    asyncio.run(body())
+
+
+def test_a_task_behind_another_bots_work_names_that_bot(make_backend, upstream) -> None:
+    """A group's reply lane opened by 乙 waits for 甲's work lane: the card names 甲."""
+    backend = make_backend()
+    team = build_group(backend)
+
+    def spec(requests, index):
+        request = requests[index - 1]
+        text = last_user_text(request)
+        if in_thread(request):
+            return {"content": "乙的新任务做完了"}
+        if "顺便开个任务" in text:
+            return start_task("乙的新任务")
+        return slow_reply(15)
+
+    upstream.script = [spec]
+
+    async def body() -> None:
+        async with client_for(backend) as client:
+            gid = team["group"]["id"]
+            work = await start_run(
+                client,
+                gid,
+                f"@{team['designer']['name']} 先做第一件",
+                mentions=[team["designer"]["id"]],
+            )
+            await wait_for_message(client, gid, status="streaming", kind="agent")
+            asked = await start_run(
+                client, gid, "顺便开个任务", mentions=[team["reviewer"]["id"]]
+            )
+            assert asked["lane"] == "reply"
+            await wait_for_run(client, asked["id"], timeout=10)
+            task = await wait_for_task(client, gid, status="queued")
+            assert task["owner_id"] == team["reviewer"]["id"]
+            assert task["current_step"] == (
+                f"排队中，等「{team['designer']['name']}」做完"
+            )
+            await client.post(f"/conversations/{gid}/tasks/{task['id']}/stop")
+            await client.post(f"/runs/{work['id']}/stop", json={})
 
     asyncio.run(body())

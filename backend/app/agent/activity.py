@@ -270,8 +270,10 @@ class Activities:
         if activity is None:
             return
         conversation_id = str(activity["conversation_id"])
-        owner = self._runs.get(conversation_id)
-        if owner is not None and owner.background:
+        if any(
+            run.background and run.conversation_id == conversation_id
+            for run in self._runs.values()
+        ):
             return
         activity_id = str(activity["id"])
         now = time.monotonic()

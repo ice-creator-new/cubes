@@ -35,7 +35,7 @@ export function TeamSettingsSection() {
   const { thumb, ready } = useSegmentedThumb(segmented, frequency);
   // The send-mode pick has a thumb of its own: the three answers to a send that meets a reply.
   const modeGroup = useRef<HTMLDivElement>(null);
-  const sendMode = settings?.send_mode ?? "steer";
+  const sendMode = settings?.send_mode ?? "parallel";
   const { thumb: modeThumb, ready: modeReady } = useSegmentedThumb(modeGroup, sendMode);
 
   const patch = async (next: Partial<TeamSettings>) => {

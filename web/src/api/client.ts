@@ -326,6 +326,15 @@ export class ApiClient {
     return this.request<{ conversation_id: string; tasks: GroupTask[] }>("GET", `conversations/${encodeURIComponent(id)}/tasks`);
   }
 
+  /** 「现在就做」: starts a queued task beside its bot's live work. */
+  startTaskNow(groupID: string, taskID: string) {
+    return this.request<{ conversation_id?: string; tasks?: GroupTask[]; task?: GroupTask }>(
+      "POST",
+      `conversations/${encodeURIComponent(groupID)}/tasks/${encodeURIComponent(taskID)}/now`,
+      {},
+    );
+  }
+
   /** Stops one task's thread run, or takes a queued one out of the line. */
   stopTask(groupID: string, taskID: string) {
     return this.request<{ conversation_id?: string; tasks?: GroupTask[]; task?: GroupTask }>(

@@ -49,12 +49,12 @@ DISPATCH_SYSTEM = (
     "\n"
     "只输出一个 JSON 对象，不要写任何解释或 Markdown：\n"
     '{"kind": "answer|steer|resume|status|none", "speakers": ["成员 id"], '
-    '"opinions": false, "task_id": null, "reason": "一句中文", "intents": []}\n'
+    '"opinions": false, "task_id": null, "affects": null, "reason": "一句中文", "intents": []}\n'
     "\n"
     "intents 是这个用户消息里分成几件事时用的（大多数消息只有一件事，就不用写）：\n"
     '每项 {"text": "这条里属于它的原话或近原话（不超过 60 字）", '
     '"kind": "answer|steer|resume|status|invite", "speakers": ["成员 id"], '
-    '"task_id": null, "invite": ["群外成员的 id"]}。\n'
+    '"task_id": null, "affects": null, "invite": ["群外成员的 id"]}。\n'
     "- 一条消息最多拆 6 项，每项最多 3 个发言人；按原话出现的顺序排。\n"
     "- 只有真的有多个互不相同的要求时才拆；一句话里的几层意思仍是一项。\n"
     "- 拆了 intents 时，外面的 kind/speakers 可以省略，系统只按 intents 执行。\n"
@@ -65,7 +65,8 @@ DISPATCH_SYSTEM = (
     "kind 的用法：\n"
     "- answer：应该有人回复。speakers 按发言顺序写 1–3 个成员的 id；"
     "opinions 为 true 表示这几个人同时、各自独立地回答（用户要大家各抒己见时）。\n"
-    "- steer：用户是对某个正在进行或还在排队的任务补充、纠正要求。task_id 写那件任务。\n"
+    "- steer：用户对正在做的事补充、纠正要求。属于 activities 里某一项时，affects 写它的 "
+    "activity_id；属于某件任务时 task_id 写那件任务。不要为 steer 再叫一个人另开一份。\n"
     "- resume：用户让某个停下或没做完的任务接着做。task_id 写那件任务。"
     "如果有好几件停下的任务都说得通、看不出是哪一件，不要猜：改用 answer，"
     "让最后发言的那位成员在群里问一句是哪一件。\n"
@@ -107,15 +108,20 @@ class Intent:
     speakers: tuple[str, ...] = ()
     task_id: str | None = None
     invite: tuple[str, ...] = ()
+    # The live activity this slice changes, when the request is about ongoing work.
+    affects: str | None = None
 
     def route(self) -> dict[str, Any]:
-        return {
+        route = {
             "text": self.text,
             "kind": self.kind,
             "speakers": list(self.speakers),
             "task_id": self.task_id,
             "invite": list(self.invite),
         }
+        if self.affects:
+            route["affects"] = self.affects
+        return route
 
 
 @dataclass(frozen=True)
@@ -126,6 +132,7 @@ class Decision:
     speakers: tuple[str, ...] = ()
     opinions: bool = False
     task_id: str | None = None
+    affects: str | None = None
     reason: str = ""
     by: str = "dispatcher"
     intents: tuple[Intent, ...] = ()
@@ -143,6 +150,8 @@ class Decision:
             "reason": self.reason,
             "by": self.by,
         }
+        if self.affects:
+            route["affects"] = self.affects
         if self.intents:
             route["intents"] = [intent.route() for intent in self.intents]
         return route
@@ -200,6 +209,7 @@ def _intent(
     allowed: set[str],
     invites: set[str],
     task_ids: set[str],
+    activity_ids: set[str] = frozenset(),
 ) -> Intent | None:
     """One intent, or ``None`` when the model named something that does not exist."""
     if not isinstance(data, dict):
@@ -222,9 +232,14 @@ def _intent(
     task_id = str(data.get("task_id") or "").strip() or None
     if task_id is not None and task_id not in task_ids:
         task_id = None
+    affects = str(data.get("affects") or "").strip() or None
+    if affects is not None and affects not in activity_ids:
+        affects = None
     if kind == KIND_ANSWER and not speakers:
         return None
-    if kind in (KIND_STEER, KIND_RESUME) and task_id is None:
+    if kind == KIND_STEER and task_id is None and affects is None:
+        return None
+    if kind == KIND_RESUME and task_id is None:
         return None
     if kind == KIND_INVITE and not invite:
         return None
@@ -238,6 +253,7 @@ def _intent(
         speakers=tuple(speakers[:MAX_SPEAKERS]),
         task_id=task_id,
         invite=tuple(invite),
+        affects=affects,
     )
 
 
@@ -247,6 +263,7 @@ def parse(
     member_ids: Sequence[str],
     task_ids: Sequence[str],
     invite_ids: Sequence[str] = (),
+    activity_ids: Sequence[str] = (),
 ) -> Decision | None:
     """Strictly read one decision; ``None`` when it is unreadable or names nothing real.
 
@@ -260,6 +277,7 @@ def parse(
     allowed = set(member_ids)
     invites = set(invite_ids)
     known_tasks = set(task_ids)
+    known_activities = set(activity_ids)
     base: dict[str, Any] = data if isinstance(data, dict) else {}
     raw_intents = data if isinstance(data, list) else base.get("intents")
     if isinstance(raw_intents, list) and raw_intents:
@@ -268,7 +286,11 @@ def parse(
             for raw in raw_intents
             if (
                 intent := _intent(
-                    raw, allowed=allowed, invites=invites, task_ids=known_tasks
+                    raw,
+                    allowed=allowed,
+                    invites=invites,
+                    task_ids=known_tasks,
+                    activity_ids=known_activities,
                 )
             )
             is not None
@@ -302,9 +324,14 @@ def parse(
     task_id = str(base.get("task_id") or "").strip() or None
     if task_id is not None and task_id not in known_tasks:
         task_id = None
+    affects = str(base.get("affects") or "").strip() or None
+    if affects is not None and affects not in known_activities:
+        affects = None
     if kind == KIND_ANSWER and not speakers:
         return None
-    if kind in (KIND_STEER, KIND_RESUME) and task_id is None:
+    if kind == KIND_STEER and task_id is None and affects is None:
+        return None
+    if kind == KIND_RESUME and task_id is None:
         return None
     reason = " ".join(str(base.get("reason") or "").split())[:120]
     return Decision(
@@ -312,6 +339,7 @@ def parse(
         speakers=tuple(speakers[:MAX_SPEAKERS]),
         opinions=bool(base.get("opinions")) and len(speakers) > 1,
         task_id=task_id,
+        affects=affects,
         reason=reason,
     )
 
@@ -323,6 +351,14 @@ def normalize(decision: Decision, addressed: Sequence[str]) -> Decision:
     follow, deduplicated, so it can add someone but never drop someone the user named. A
     ``none`` that contradicts an address becomes an answer for the addressed members.
     """
+    if decision.kind == KIND_STATUS and any(addressed):
+        # 「@主簿 现在什么进度」 asks 主簿, not the group: it answers in a reply lane, which
+        # reads its own board, instead of a card that knows only what is still running.
+        return Decision(
+            kind=KIND_ANSWER,
+            speakers=tuple(agent_id for agent_id in addressed if agent_id),
+            reason=decision.reason or "用户点名问进度，由被点名的成员自己回答。",
+        )
     if decision.intents or decision.kind not in (KIND_ANSWER, KIND_NONE):
         return decision
     order: list[str] = [agent_id for agent_id in addressed if agent_id]

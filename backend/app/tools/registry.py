@@ -30,8 +30,34 @@ EXECUTION_TOOL_NAMES = frozenset(
 )
 
 
+# A reply lane answers beside the work; it may look things up and hand real work off, but
+# it may not change a file, run a mutating command or touch the computer. Keep this list
+# exactly the read-only tools plus the two escapes: ``start_task`` (queue the actual work)
+# and ``ask_user`` (a decision belongs to the user).
+REPLY_TOOL_NAMES = frozenset(
+    {
+        "web_search",
+        "fetch_url",
+        "file_read",
+        "file_list",
+        "search_history",
+        "read_conversation",
+        "note_read",
+        "note_list",
+        "task_list",
+        "current_time",
+        "calculate",
+        "team_progress",
+        "start_task",
+        "ask_user",
+    }
+)
+
+
 def _visible(handler: ToolHandler, offer: ToolOffer) -> bool:
     """Whether this handler belongs in one offer's list at all (role and environment)."""
+    if offer.read_only and handler.name not in REPLY_TOOL_NAMES:
+        return False
     return handler.offered(offer) and not (
         offer.coordinating and handler.name in EXECUTION_TOOL_NAMES
     )
@@ -55,6 +81,8 @@ class ToolRegistry:
         """The handler for ``name`` if this offer may call it, else ``None``."""
         handler = self._by_name.get(name)
         if handler is None or not handler.callable(offer):
+            return None
+        if offer.read_only and handler.name not in REPLY_TOOL_NAMES:
             return None
         if offer.coordinating and handler.name in EXECUTION_TOOL_NAMES:
             return None

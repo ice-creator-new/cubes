@@ -1,15 +1,29 @@
 // Pure helpers for the team panel: who is doing what, token formatting, and budget state.
 
-import type { TokenBudget, UsagePeriod, Workspace } from "../api/types";
+import type { RunLane, TokenBudget, UsagePeriod, Workspace } from "../api/types";
 
 export type AgentActivity =
-  | { kind: "working"; conversationID: string; conversationTitle: string; step: string; waitingTurn: boolean }
+  | {
+      kind: "working";
+      conversationID: string;
+      conversationTitle: string;
+      step: string;
+      waitingTurn: boolean;
+      /** Which of its lanes this is; a bot working and answering at once reports work. */
+      lane: RunLane;
+    }
   | { kind: "idle" };
 
 /** The run this member is part of: its own turn first, then a queued slot; idle when neither. */
 export function activityOf(agentID: string, workspace: Workspace): AgentActivity {
-  const current = workspace.active_runs.find((run) => run.current_agent_id === agentID);
-  const run = current ?? workspace.active_runs.find((run) => run.pending_agent_ids.includes(agentID));
+  // A member can hold two lanes at once (working and answering): the work lane is the headline.
+  const current =
+    workspace.active_runs.find((run) => run.current_agent_id === agentID && run.lane !== "reply") ??
+    workspace.active_runs.find((run) => run.current_agent_id === agentID);
+  const run =
+    current ??
+    workspace.active_runs.find((run) => run.pending_agent_ids.includes(agentID) && run.lane !== "reply") ??
+    workspace.active_runs.find((run) => run.pending_agent_ids.includes(agentID));
   if (!run) return { kind: "idle" };
   const conversation = workspace.conversations.find((item) => item.id === run.conversation_id);
   return {
@@ -18,6 +32,7 @@ export function activityOf(agentID: string, workspace: Workspace): AgentActivity
     conversationTitle: conversation?.title ?? "",
     step: run.current_step,
     waitingTurn: current === undefined,
+    lane: run.lane,
   };
 }
 

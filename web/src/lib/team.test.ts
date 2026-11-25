@@ -8,6 +8,7 @@ function run(overrides: Partial<Run> = {}): Run {
     conversation_id: "c1",
     status: "running",
     current_step: "「小南」正在思考",
+    lane: "work",
     error: null,
     model_calls: 0,
     tool_calls: 0,
@@ -48,6 +49,7 @@ describe("activityOf", () => {
       conversationTitle: "市场调研",
       step: "「小南」正在思考",
       waitingTurn: false,
+      lane: "work",
     });
   });
 
@@ -59,6 +61,7 @@ describe("activityOf", () => {
       conversationTitle: "市场调研",
       step: "「小南」正在思考",
       waitingTurn: true,
+      lane: "work",
     });
   });
 
@@ -73,6 +76,7 @@ describe("activityOf", () => {
       conversationTitle: "写周报",
       step: "「小南」正在思考",
       waitingTurn: false,
+      lane: "work",
     });
   });
 

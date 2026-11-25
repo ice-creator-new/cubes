@@ -6,7 +6,8 @@
 // wait above the text (images as thumbnails, files as chips) until the message goes.
 
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
-import type { Agent, Run, SendMode } from "../api/types";
+import { createPortal } from "react-dom";
+import type { Agent, Run } from "../api/types";
 import { errorMessage } from "../api/client";
 import {
   MAX_ATTACHMENTS,
@@ -23,9 +24,8 @@ import { composingKey } from "../lib/ime";
 import { insertMention, mentionCandidates, mentionedIDs, mentionQuery } from "../lib/mentions";
 import { insertSlash, slashQuery } from "../lib/skills";
 import { useAnimatedHeight, usePresence } from "../lib/motion";
-import { isCliBot } from "../lib/modelOptions";
 import { filesOf, hasFiles, prepareAttachment } from "../lib/pickAttachments";
-import { busyPlaceholder, resolveSendMode } from "../lib/sendMode";
+import { stopChoices } from "../lib/sendMode";
 import { drafts, moodFor, store, useDraft, useTeam } from "../state/store";
 import { Avatar } from "./Avatar";
 import { AskPanel, type AskQuestion } from "./AskPanel";
@@ -56,7 +56,7 @@ export function Composer({
   conversationID,
   roster,
   outside = [],
-  run,
+  runs,
   placeholder,
   autoFocus,
   fallbackAnswerer,
@@ -66,7 +66,8 @@ export function Composer({
   roster: Agent[];
   /** Team agents not in this group: offered under 「不在群里」, and pulled in when @-ed. */
   outside?: Agent[];
-  run: Run | undefined;
+  /** Every live lane here: a bot may be working while another answers. */
+  runs: Run[];
   placeholder: string;
   autoFocus?: boolean;
   /** Who answers when the draft names nobody: a direct chat's member, else the supervisor. */
@@ -135,25 +136,69 @@ export function Composer({
   const skillOpen = slash !== null && skillCandidates.length > 0 && !pickerDismissed;
   const pickerOpen = mentionOpen || skillOpen;
   const pickerCount = mentionOpen ? candidates.length : skillCandidates.length;
-  const busy = Boolean(run);
-  // Sending while the bot works is a setting now: the bot's own pick, else the team's. A CLI
-  // bot cannot take a message mid-turn and attachments cannot join a request already sent, so
-  // both fall back to a queue and the one-line hint says what will happen.
-  const teamMode = state.teamSettings?.send_mode ?? "steer";
-  const speaker = run?.current_agent_id
-    ? roster.find((agent) => agent.id === run.current_agent_id)
-    : undefined;
-  const modeOwner = speaker ?? answerer;
-  const cliBot = isCliBot(modeOwner, state.providers);
-  const withAttachments = attachments.length > 0;
-  const agentMode = modeOwner?.send_mode ?? null;
-  const sendMode = resolveSendMode(agentMode, teamMode, cliBot, withAttachments);
+  const busy = runs.length > 0;
   // An edit carries only text: the attachments of the message being corrected stay with it.
   const hasDraft = editing ? draft.trim().length > 0 : draft.trim().length > 0 || attachments.length > 0;
   const canSend = hasDraft && !sending && !uploading;
   // While a reply runs with nothing typed the button stops it; with text it sends in the
   // mode the bot's and the team's settings resolve to.
   const stopMode = busy && !hasDraft && !sending && !editing;
+  // Several lanes at once make "stop" ambiguous: the button then opens a menu that names each.
+  // The menu lives on `document.body` at the button's screen point: the composer's frosted card
+  // and the chat's own layers would otherwise paint over a popup nested inside them.
+  const [stopMenu, setStopMenu] = useState(false);
+  const [stopAnchor, setStopAnchor] = useState<{ right: number; bottom: number } | null>(null);
+  const stopMenuRef = useRef<HTMLDivElement>(null);
+  const stopOptions = stopChoices(
+    runs,
+    (run) =>
+      roster.find((agent) => agent.id === run.current_agent_id)?.name ??
+      // A run's turn has not landed in current_agent_id yet: its own activity names the bot.
+      Object.values(state.activities).find((activity) => activity.run_id === run.id)?.agent_name ??
+      "机器人",
+  );
+
+  useEffect(() => {
+    if (!stopMenu) return;
+    const close = () => setStopMenu(false);
+    const onPointer = (event: PointerEvent) => {
+      const target = event.target as Element | null;
+      if (!target?.closest(".stop-menu") && !target?.closest(".stop-menu-anchor")) close();
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("pointerdown", onPointer);
+    window.addEventListener("keydown", onKey);
+    // A fixed menu would drift away from its button: the first scroll or resize puts it away.
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    return () => {
+      window.removeEventListener("pointerdown", onPointer);
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+    };
+  }, [stopMenu]);
+
+  useEffect(() => {
+    if (!stopMode) setStopMenu(false);
+  }, [stopMode]);
+
+  const toggleStopMenu = () => {
+    if (runs.length <= 1) {
+      void store.stop(conversationID, runs[0]?.id);
+      return;
+    }
+    const rect = stopMenuRef.current?.getBoundingClientRect();
+    if (rect) setStopAnchor({ right: window.innerWidth - rect.right, bottom: window.innerHeight - rect.top + 10 });
+    setStopMenu((open) => !open);
+  };
+
+  const stopLane = (id?: string) => {
+    setStopMenu(false);
+    void store.stop(conversationID, id);
+  };
 
   // A conversation's tray belongs to it: switching away drops what was not sent.
   useEffect(() => {
@@ -269,9 +314,9 @@ export function Composer({
     place(insertSlash(drafts.get(conversationID), name, caretNow()));
   }
 
-  // ``override`` is the stop-and-send shortcut (⌘↵ / Ctrl+Enter) while a reply runs; a plain
-  // send leaves the mode to the server, which reads the bot's and the team's settings.
-  const send = async (override?: SendMode) => {
+  // A send leaves the mode to the server, which reads the bot's and the team's settings: the
+  // message never interrupts work unless 「停下再发」 is the chosen mode.
+  const send = async () => {
     if (!canSend) return;
     if (editing) {
       const failure = await store.editMessage(conversationID, editing.messageID, draft);
@@ -281,14 +326,7 @@ export function Composer({
     }
     const ids = mentionedIDs(draft, roster);
     const attachmentIDs = attachments.map((item) => item.id).filter((id): id is string => id !== null);
-    const failure = await store.send(
-      conversationID,
-      draft,
-      ids,
-      reply?.messageID,
-      attachmentIDs,
-      busy ? override : undefined,
-    );
+    const failure = await store.send(conversationID, draft, ids, reply?.messageID, attachmentIDs);
     if (failure) setError(failure);
     else {
       setCaret(0);
@@ -415,7 +453,7 @@ export function Composer({
         }}
       >
         {/* The capacity line is the card's own top edge, not a separate row above it. */}
-        <ContextBar conversationID={conversationID} run={run} busy={busy} />
+        <ContextBar conversationID={conversationID} runs={runs} busy={busy} />
         <div
           className={quote.open ? "reply-slot collapse open" : "reply-slot collapse"}
           inert={!quote.open}
@@ -557,13 +595,7 @@ export function Composer({
             agents={agentsByName}
             skills={skillNames}
             composing={composition}
-            placeholder={
-              editing
-                ? "修改这条消息，回车重新生成"
-                : busy
-                  ? busyPlaceholder(sendMode)
-                  : placeholder
-            }
+            placeholder={editing ? "修改这条消息，回车重新生成" : placeholder}
             describedBy={
               editing
                 ? `edit-chip-${conversationID}`
@@ -626,8 +658,7 @@ export function Composer({
               }
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
-                // While a reply runs, ⌘↵ / Ctrl+Enter is the one press that still speaks now.
-                void send(busy && (event.metaKey || event.ctrlKey) ? "interrupt" : undefined);
+                void send();
               }
             }}
           />
@@ -644,45 +675,72 @@ export function Composer({
                 <Icon name="at" size={16} />
               </button>
             )}
-            <button
-              type={stopMode ? "button" : "submit"}
-              className="send-button"
-              onClick={stopMode ? () => void store.stop(conversationID) : undefined}
-              disabled={stopMode ? stopping : !canSend}
-              aria-label={
-                stopMode ? (stopping ? "正在停止" : "停止") : editing ? "保存并重新生成" : "发送"
-              }
-              title={
-                stopMode
-                  ? stopping
-                    ? "正在停止"
-                    : "停止"
-                  : editing
-                    ? "保存并重新生成（Esc 取消）"
-                    : busy
-                      ? sendMode === "steer"
-                        ? "加入当前这一轮"
-                        : sendMode === "queue"
-                          ? "排队，等这一轮结束再发"
-                          : "停止并发送"
+            <div className="stop-menu-anchor" ref={stopMenuRef}>
+              <button
+                type={stopMode ? "button" : "submit"}
+                className="send-button"
+                onClick={stopMode ? toggleStopMenu : undefined}
+                disabled={stopMode ? stopping : !canSend}
+                aria-haspopup={stopMode && runs.length > 1 ? "menu" : undefined}
+                aria-expanded={stopMode && runs.length > 1 ? stopMenu : undefined}
+                aria-label={
+                  stopMode ? (stopping ? "正在停止" : "停止") : editing ? "保存并重新生成" : "发送"
+                }
+                title={
+                  stopMode
+                    ? stopping
+                      ? "正在停止"
+                      : runs.length > 1
+                        ? "停下哪一路"
+                        : "停止"
+                    : editing
+                      ? "保存并重新生成（Esc 取消）"
                       : "发送"
-              }
-            >
-              <span className={stopMode || sending ? "send-glyph" : "send-glyph on"}>
-                <Icon name="send" size={18} />
-              </span>
-              <span className={stopMode ? "send-glyph on" : "send-glyph"}>
-                <Icon name="stop" size={14} />
-              </span>
-              {sending && (
-                <span className="send-glyph on">
-                  <span className="spinner" />
+                }
+              >
+                <span className={stopMode || sending ? "send-glyph" : "send-glyph on"}>
+                  <Icon name="send" size={18} />
                 </span>
-              )}
-            </button>
+                <span className={stopMode ? "send-glyph on" : "send-glyph"}>
+                  <Icon name="stop" size={14} />
+                </span>
+                {sending && (
+                  <span className="send-glyph on">
+                    <span className="spinner" />
+                  </span>
+                )}
+              </button>
+            </div>
           </div>
         </div>
       </form>
+      {stopMode &&
+        stopMenu &&
+        stopAnchor &&
+        runs.length > 1 &&
+        createPortal(
+          <div
+            className="stop-menu"
+            role="menu"
+            aria-label="停下哪一路"
+            style={{ right: stopAnchor.right, bottom: stopAnchor.bottom }}
+          >
+            {stopOptions.map((option) => (
+              <button
+                key={option.id || "all"}
+                type="button"
+                role="menuitem"
+                className={option.id ? "stop-menu-item" : "stop-menu-item all"}
+                disabled={stopping}
+                onClick={() => stopLane(option.id || undefined)}
+              >
+                <Icon name="stop" size={11} />
+                <span>{option.label}</span>
+              </button>
+            ))}
+          </div>,
+          document.body,
+        )}
       {hasImages && !answererSees && <p className="composer-note">{blindNote(answerer)}</p>}
       {hasPDFs && !agentReadsPDFs(answerer, state.providers) && <p className="composer-note">{pdfNote(answerer)}</p>}
       {error && (

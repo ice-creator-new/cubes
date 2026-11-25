@@ -6,12 +6,15 @@ import type { Activity, Agent } from "../api/types";
 import {
   ACTIVITY_STATUS_META,
   activityChipText,
+  activityLane,
   activityProgressLine,
   activityStepLine,
   activityThinking,
   isLiveActivity,
 } from "../lib/activities";
 import { useSecondTick } from "../lib/motion";
+import type { BubbleQuote } from "../lib/quotes";
+import { useTeam } from "../state/store";
 import { AuthorLine } from "./AuthorLine";
 import { TOOL_ICON } from "../lib/toolIcons";
 import { Icon, type IconName } from "./Icon";
@@ -43,6 +46,8 @@ export function ActivitySlotView({
   fallbackSeed,
   showAuthor,
   onOpen,
+  quote = null,
+  onJumpQuote,
 }: {
   activity: Activity | undefined;
   activityID: string;
@@ -54,9 +59,14 @@ export function ActivitySlotView({
   /** Whether this is the first row of the bot's burst: the card draws the author line. */
   showAuthor: boolean;
   onOpen: (activityID: string) => void;
+  /** The question this finished chip answers, when the user spoke again before it landed. */
+  quote?: BubbleQuote | null;
+  onJumpQuote?: (messageID: string) => void;
 }) {
   const live = activity ? isLiveActivity(activity.status) : true;
   const now = useSecondTick(live);
+  // A bot answering beside its own work: the tag is what tells the two cards apart.
+  const replyLane = useTeam((s) => activityLane(activity, s.workspace?.active_runs) === "reply");
   if (activity && !live) {
     const meta = ACTIVITY_STATUS_META[activity.status];
     const chip = (
@@ -72,15 +82,28 @@ export function ActivitySlotView({
       </button>
     );
     // A finished turn that left no answer stands on its own: who stopped is still named above.
-    if (!showAuthor) return chip;
+    // The quote names the question even when the chip continues the bot's own burst.
+    if (!showAuthor && !quote) return chip;
     return (
       <article className="turn agent activity-turn">
-        <AuthorLine
-          agent={agent}
-          fallbackName={activity.agent_name || fallbackName}
-          fallbackSeed={fallbackSeed}
-          mood="idle"
-        />
+        {showAuthor && (
+          <AuthorLine
+            agent={agent}
+            fallbackName={activity.agent_name || fallbackName}
+            fallbackSeed={fallbackSeed}
+            mood="idle"
+          />
+        )}
+        {quote && (
+          <button
+            type="button"
+            className="bubble-quote activity-quote"
+            onClick={() => onJumpQuote?.(quote.id)}
+            aria-label={`查看被回复的消息，来自${quote.label}`}
+          >
+            回复 {quote.label}：{quote.excerpt}
+          </button>
+        )}
         {chip}
       </article>
     );
@@ -97,7 +120,13 @@ export function ActivitySlotView({
           note={activity?.status === "awaiting" ? "等你确认" : undefined}
         />
       )}
-      <ActivityCardBody activity={activity} title={title} now={now} onOpen={() => onOpen(activityID)} />
+      <ActivityCardBody
+        activity={activity}
+        title={title}
+        now={now}
+        replyLane={replyLane}
+        onOpen={() => onOpen(activityID)}
+      />
 
     </article>
   );
@@ -108,11 +137,14 @@ function ActivityCardBody({
   activity,
   title,
   now,
+  replyLane,
   onOpen,
 }: {
   activity: Activity | undefined;
   title: string;
   now: number;
+  /** Answered beside the bot's work: a small tag keeps the two cards apart. */
+  replyLane: boolean;
   onOpen: () => void;
 }) {
   const working = activity === undefined || activity.status === "running";
@@ -131,6 +163,7 @@ function ActivityCardBody({
       </span>
       <span className="activity-card-body">
         <span className="activity-card-head">
+          {replyLane && <span className="activity-card-tag">回答中</span>}
           <span className="activity-card-title">{title}</span>
           {activity && <span className="activity-card-meta">{activityProgressLine(activity, now)}</span>}
         </span>

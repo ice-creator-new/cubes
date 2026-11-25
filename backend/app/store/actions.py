@@ -11,6 +11,50 @@ import sqlite3
 
 from .db import new_id, now_iso
 
+# The board a working turn writes; its items ride the row so the chat needs no second read.
+TODO_WRITE = "todo_write"
+BOARD_STATUSES = ("pending", "doing", "done", "dropped")
+# The board's own limit (``app.tools.board.MAX_TODOS``); a row never carries more.
+BOARD_LIMIT = 12
+
+
+def _board_todos(result: str | None, arguments: str | None) -> list[dict] | None:
+    """A ``todo_write`` call's items: its finished result first, else what it asked for.
+
+    The result is the board as the tool left it; the arguments are the plan the call sent,
+    which is all a row has while the call is still running. Anything unreadable or empty
+    reads as "no board", and the row falls back to its plain sentence.
+    """
+    for raw in (result, arguments):
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        items = payload.get("todos")
+        if not isinstance(items, list):
+            items = payload.get("items")
+        if not isinstance(items, list):
+            continue
+        board: list[dict] = []
+        for item in items[:BOARD_LIMIT]:
+            if not isinstance(item, dict):
+                continue
+            text = " ".join(str(item.get("text") or "").split())
+            if not text:
+                continue
+            status = str(item.get("status") or "pending")
+            board.append(
+                {"text": text, "status": status if status in BOARD_STATUSES else "pending"}
+            )
+        if board:
+            return board
+    return None
+
+
 class Actions:
     """Actions, the confirmation state machine and tool invocations."""
 
@@ -378,15 +422,20 @@ class Actions:
                     message_ids,
                 )
         return len(rows)
-    def streaming_message_ids(self, conversation_id: str) -> list[str]:
-        """Messages of one conversation currently marked streaming, oldest first."""
+    def streaming_message_ids(
+        self, conversation_id: str, run_id: str | None = None
+    ) -> list[str]:
+        """Messages of one conversation (or one run) currently streaming, oldest first."""
         conn = self._ensure()
+        sql = (
+            "SELECT id FROM messages WHERE conversation_id = ? AND status = 'streaming' "
+        )
+        params: list[Any] = [conversation_id]
+        if run_id is not None:
+            sql += "AND run_id = ? "
+            params.append(run_id)
         with self._lock:
-            rows = conn.execute(
-                "SELECT id FROM messages WHERE conversation_id = ? AND status = 'streaming' "
-                "ORDER BY rowid ASC",
-                (conversation_id,),
-            ).fetchall()
+            rows = conn.execute(sql + "ORDER BY rowid ASC", params).fetchall()
         return [str(row["id"]) for row in rows]
     def get_invocation(self, run_id: str, tool_call_id: str) -> dict | None:
         conn = self._ensure()
@@ -429,6 +478,11 @@ class Actions:
     def _action_row(row: sqlite3.Row) -> dict:
         confirmation = row["confirmation"]
         detail = row["detail"]
+        todos = (
+            _board_todos(row["result"], row["arguments"])
+            if row["tool_name"] == TODO_WRITE
+            else None
+        )
         return {
             "id": row["id"],
             "run_id": row["run_id"],
@@ -441,4 +495,5 @@ class Actions:
             "error": row["error"],
             "confirmation": json.loads(confirmation) if confirmation else None,
             "detail": json.loads(detail) if detail else None,
+            "todos": todos,
         }

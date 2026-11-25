@@ -15,7 +15,7 @@ def test_team_settings_defaults(make_backend) -> None:
             response = await client.get("/settings/team")
             assert response.status_code == 200, response.text
             data = response.json()
-            assert data["send_mode"] == "steer"
+            assert data["send_mode"] == "parallel"
             assert data["supervisor_works_in_groups"] is False
             assert data["review"] == {"enabled": False, "max_rounds": 2}
             assert data["digest"] == {

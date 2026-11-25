@@ -10,9 +10,18 @@ from __future__ import annotations
 # How the model learns its last turn was cut short, on either side of the interruption.
 CUT_OFF_NOTE = "（这条回复还没说完就被打断了。）"
 INTERRUPTS_NOTE = "（这条消息发出时上一轮回复还没结束，已被它打断。）"
-STEER_NOTE = (
-    "（这条消息是在你这一轮还没做完时插进来的，不是新的任务："
-    "把它当作同一个目标下补充的要求，接着刚才的工作调整方向，不要从头重做。）"
+# Another lane told this one something, delivered at a call boundary (never mid-stream).
+NOTE_CONTEXT_NOTE = "（群里刚刚发生的事，只是背景，不用专门回应：）"
+NOTE_REQUEST_NOTE = (
+    "（用户的新要求，不是新任务：先把它加进待办，做到时照做，不要中断手上的这一步。）"
+)
+
+# The progress board every working turn keeps. A reply lane reads it; it never writes one.
+TODO_RULE = (
+    "\n\n进度板：这一轮如果要做几步（写代码、查资料、操作电脑、做出一件东西），"
+    "在调用第一个别的工具之前，先调用 todo_write 写下 2–12 条待办，每条一句话、不超过 60 字；"
+    "每完成一条就改成 done，正在做的那条保持 doing（只能有一条），做不了或不再需要的标 dropped。"
+    "只问一句、查一个现成事实就不用写。"
 )
 
 # A scheduled run works in a hidden conversation: only the owner's summary reaches the user.
@@ -143,10 +152,32 @@ GROUP_COORDINATE_RULE = (
     "只有用户明确 @你 要你亲自做，或团队设置打开了「主管在群里亲自动手」时，才自己动手。"
 )
 
-# A user's addition that the dispatcher steered into a task that is already running.
-TASK_STEER_NOTE = (
-    "（用户在群里对这个任务补了一句，不是新任务：把它当作同一个目标下补充或纠正的要求，"
-    "接着现在的工作调整方向，已经做完的部分不要重做。）"
+# A reply lane's one fact block: what its own work lane (and the group's other live lanes)
+# has actually done. The reply may only state progress from this block.
+REPLY_PROGRESS_NOTE = (
+    "（你另一路正在做：{title}。已完成：{done}；正在做：{doing}；待办：{pending}；"
+    "最近的步骤：{steps}。回答用户时以这些为准，不要编造进度。"
+    "这一路只能查阅和回答，不要动手改文件或操作电脑；如果用户要的是一件新活，"
+    "用 start_task 交给任务线排队。）"
+)
+
+# How many lookups one reply-lane turn may spend before it must wrap up. The lane exists to
+# answer beside the work, not to do the work itself: reading a dozen files here delays the
+# task card the user actually wants and puts the reading in the wrong thread.
+REPLY_TOOL_CAP = 6
+REPLY_TOOL_LIMIT_NOTE = (
+    "回答这一路只做简短查阅；要动手的活请用 start_task 交给任务线"
+)
+
+# Every reply lane gets this before the board block. A request for real work is handed off
+# first: the task thread does its own reading, in the place the user can watch it.
+REPLY_LANE_RULE = (
+    "\n\n这一路是回答，不是动手：先分清用户要的是一句话，还是一件活。"
+    "要是写、改、做、跑、查一堆资料这样的真活，第一步就调用 start_task 把它交给任务线，"
+    "不要先自己读一圈文件、翻一遍记录再交——那些阅读是任务线自己的线程该做的事，"
+    "放在这里只会让任务卡片迟迟不出现。"
+    f"只有回答一个问题确实要看现成的东西时，才做简短查阅（这一轮最多 {REPLY_TOOL_CAP} 步），"
+    "查到能回答就停下来用一句话说清。"
 )
 
 # Asking the user rather than guessing, and the three tools that change the team itself.
@@ -314,6 +345,19 @@ MEMBER_THREAD_SYSTEM = (
     "所以可以一步步边做边说，不用克制。\n"
     "群组成员：\n{roster}\n"
     "不要在这里 @ 同事寒暄，也不要复述群里的闲聊；需要同事帮忙时用团队工具。"
+    "收尾时写一条能单独读懂的结论：做了什么、结果怎样、需要用户决定什么（如果有）；"
+    "不要提这个工作线程，也不要复述中间过程。\n"
+    + TOOL_GUIDE
+    + "\n像同事之间说话那样口语、简短，不要使用 Markdown 标题。"
+    + IMAGES_RULE
+) + MOOD_RULE
+
+# A direct chat's task thread: same hidden work, but the chat it answers is the user's own.
+MEMBER_THREAD_DIRECT_SYSTEM = (
+    "你是「{name}」，团队中的一名成员。你的职责：{instructions}\n"
+    "你正在替用户做一件活：「{purpose}」。这是这件事自己的工作线程：你在这里的中间"
+    "过程、工具调用和短句都只留在这里，用户看得到一张任务卡片和你最后发到聊天里的那条结论。"
+    "所以可以一步步边做边说，不用克制。\n"
     "收尾时写一条能单独读懂的结论：做了什么、结果怎样、需要用户决定什么（如果有）；"
     "不要提这个工作线程，也不要复述中间过程。\n"
     + TOOL_GUIDE

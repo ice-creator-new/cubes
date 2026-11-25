@@ -16,7 +16,8 @@ import time
 from typing import Any
 
 from . import models, prompts
-from .errors import EngineBusy
+from .agent.run_state import LANES_PER_GROUP
+from .errors import EngineBusy, TaskBusy
 from .store import group_tasks as task_rules
 from .store import now_iso
 
@@ -41,6 +42,8 @@ class TaskScheduler:
         # Parent tasks parked on a part: they hold no execution slot (they are waiting, not
         # working), so the cap still describes how many runs are really busy.
         self._waiting_on_part: set[str] = set()
+        # Tasks a reply lane opened: they wait for the group's work lane to end first.
+        self._behind_lane: set[str] = set()
         self._wake_task: asyncio.Task | None = None
         # When each task's live payload last reached its card (monotonic seconds).
         self._progress_at: dict[str, float] = {}
@@ -53,8 +56,13 @@ class TaskScheduler:
         *,
         instruction: str | None = None,
         another_round: bool = False,
+        behind_lane: bool = False,
     ) -> dict | None:
-        """Put one task in the queue, then start whatever the caps allow right now."""
+        """Put one task in the queue, then start whatever the caps allow right now.
+
+        ``behind_lane`` marks a task a reply lane opened: it waits until the group's live
+        work lane ends, so answering a question never starts the same bot twice at once.
+        """
         async with self._lock:
             updated = self._store.update_group_task(
                 task_id,
@@ -72,6 +80,12 @@ class TaskScheduler:
                 return None
             if instruction:
                 self._instructions[task_id] = instruction
+            if behind_lane:
+                self._behind_lane.add(task_id)
+                # The card says what it waits for: the chat's live lane.
+                updated = self._store.update_group_task(
+                    task_id, current_step=self._behind_lane_step(updated)
+                ) or updated
             self._touch_card(updated, status="streaming", content=updated["title"])
             self._publish_group_tasks(updated["conversation_id"])
             self._publish_workspace()
@@ -82,17 +96,45 @@ class TaskScheduler:
         async with self._lock:
             await self._pump_locked()
 
+    def _behind_lane_step(self, task: dict) -> str:
+        """The card's wait line: this bot's own reply, or the other bot whose work holds it.
+
+        A task opened by a reply lane waits for the chat's work lane. When that lane is the
+        same bot still answering, naming it would read as waiting for itself, so it says
+        「这一轮回复」 instead; a group's other bot is named as before.
+        """
+        owner_id = str(task.get("owner_id") or "")
+        for run in self._store.active_runs_in(str(task["conversation_id"])):
+            if str(run.get("lane") or "work") == "reply":
+                continue
+            holder_id = str(run.get("current_agent_id") or "")
+            if holder_id and holder_id == owner_id:
+                return "排队中，等这一轮回复结束"
+            holder = self._store.get_agent(holder_id) if holder_id else None
+            if holder is not None:
+                return f"排队中，等「{holder['name']}」做完"
+        owner = self._store.get_agent(owner_id) if owner_id else None
+        return f"排队中，等「{owner['name']}」做完" if owner else "排队中，等前面的回复结束"
+
     def on_run_finished(self, run_id: str) -> None:
         """Engine hook: a run (group or thread) ended; settle any part, then refill slots."""
         task = self._store.task_of_run(run_id)
         if task is None:
-            # A group run ending frees no thread slot. A thread run may have ended before it
-            # could bind (or after a race with a queued task), so its page still gets a pump.
+            # A group run ending frees no thread slot, but it may release a task a reply
+            # lane opened (``behind_lane``). A thread run may have ended before it could
+            # bind, so its page still gets a pump too.
             run = self._store.get_run(run_id)
             conversation = (
                 self._store.get_conversation(run["conversation_id"]) if run is not None else None
             )
-            if conversation is None or conversation["kind"] != "thread":
+            if conversation is None:
+                return
+            if conversation["kind"] != "thread":
+                if self._behind_lane:
+                    try:
+                        asyncio.get_running_loop().create_task(self._wake())
+                    except RuntimeError:  # pragma: no cover - finalize runs inside the loop
+                        pass
                 return
         else:
             self._resolve_part(task)
@@ -148,6 +190,10 @@ class TaskScheduler:
             if self._store.active_run(thread_id) is not None or self._engine.is_running(thread_id):
                 # A message the user posted into that thread holds it right now.
                 continue
+            if task["id"] in self._behind_lane:
+                if self._engine.is_running(str(current["conversation_id"])):
+                    continue
+                self._behind_lane.discard(task["id"])
             if await self._start(current):
                 started_any = True
         if started_any:
@@ -276,7 +322,7 @@ class TaskScheduler:
     def note_instruction(self, task_id: str, text: str) -> dict | None:
         """A queued task's opening gains the user's addition; the run reads it when it starts.
 
-        The task has not started, so there is no run to steer: appending to its stored
+        The task has not started, so there is no lane to tell: appending to its stored
         instruction (and to the opening kept for it in memory) is what the thread will be told.
         """
         task = self._store.get_group_task(task_id)
@@ -295,7 +341,7 @@ class TaskScheduler:
     # ------------------------------------------------------------------ user actions
 
     async def merge(self, group_id: str, task_id: str) -> dict | None:
-        """「并入正在做的那件」: a queued task joins its owner's running thread as a steer."""
+        """「并入正在做的那件」: a queued task becomes a note on its owner's live work."""
         async with self._lock:
             task = self._store.get_group_task(task_id)
             if task is None or task["conversation_id"] != group_id:
@@ -311,12 +357,23 @@ class TaskScheduler:
             owner = self._store.get_agent(str(task["owner_id"]))
             if owner is None:  # pragma: no cover - the task's owner existed moments ago
                 return None
-            message = self._store.append_user_message(
-                str(running["thread_id"]),
-                prompts.merge_note(str(task["title"]), str(task.get("instruction") or "")),
-                [owner["id"]],
+            text = prompts.merge_note(
+                str(task["title"]), str(task.get("instruction") or "")
             )
-            self._engine.steer(active, message)
+            noted = False
+            for activity in self._store.activities_of_run(
+                str(running.get("run_id") or ""), unfinished=True
+            ):
+                if str(activity.get("agent_id") or "") != str(owner["id"]):
+                    continue
+                noted = (
+                    self._engine.note_work_activity(
+                        str(activity["id"]), kind="request", text=text
+                    )
+                    or noted
+                )
+            if not noted:
+                self._engine.add_note(active, kind="request", text=text)
             self._instructions.pop(task_id, None)
             merged = self._store.update_group_task(
                 task_id,
@@ -396,6 +453,33 @@ class TaskScheduler:
         # ``enqueue`` takes this same lock, so it must run after the block above.
         await self.enqueue(task_id, instruction=instruction, another_round=True)
         return self._store.task_payload(self._store.get_group_task(task_id) or task)
+
+    async def start_now(self, conversation_id: str, task_id: str) -> dict | None:
+        """「现在就做」: start a queued task beside its owner's live work.
+
+        The user asked for this one now, so it bypasses the per-member rule (a member may
+        have a second task running) and the wait for that chat's live lane. The caps that
+        protect the machine stay: the team-wide parallel limit and the chat's own lane cap.
+        """
+        async with self._lock:
+            task = self._store.get_group_task(task_id)
+            if task is None or task["conversation_id"] != conversation_id:
+                return None
+            if task["status"] != task_rules.QUEUED or task.get("dismissed_at"):
+                raise TaskBusy("这个任务已经不在排队，不能现在开始。")
+            thread_id = task.get("thread_id")
+            if not thread_id:
+                raise TaskBusy("这个任务还没有自己的工作线程。")
+            if len(self._store.active_runs_in(conversation_id)) >= LANES_PER_GROUP:
+                raise TaskBusy("这个聊天同时在做的事已经满了，等一件做完再开始。")
+            if self._active_count() >= max(1, min(8, self._max_parallel())):
+                raise TaskBusy("同时在做的任务满了，等一件做完再开始。")
+            if self._store.active_run(thread_id) is not None or self._engine.is_running(thread_id):
+                raise TaskBusy("这个任务自己的线程正在处理一条消息，等它说完再开始。")
+            self._behind_lane.discard(task_id)
+            if not await self._start(task):
+                raise TaskBusy("这个任务刚刚被别的运行占住了，稍后再试。")
+            return self._store.task_payload(self._store.get_group_task(task_id) or task)
 
     def dismiss(self, group_id: str, task_id: str) -> dict | None:
         """「不做了」: put a stopped/failed task down for good (its card stays, greyed)."""

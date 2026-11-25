@@ -59,6 +59,10 @@ class ToolError(BackendError):
     """Tool arguments or targets were rejected; the message goes back to the model."""
 
 
+class TaskBusy(BackendError):
+    """A task cannot start right now; the message says why, for the user."""
+
+
 class EngineBusy(RuntimeError):
     """Raised when this conversation already owns a running run."""
 

@@ -44,6 +44,38 @@ describe("status card rows", () => {
   });
 });
 
+describe("live work on the card", () => {
+  it("lists work running in the group with its board, so the card is not empty", () => {
+    const view = statusCardRows(
+      {
+        tasks: [],
+        idle: ["主簿", "匠师"],
+        activities: [
+          {
+            activity_id: "ac1",
+            agent: "军师",
+            title: "出技术方案",
+            current_step: "「军师」正在思考（10 秒）",
+            latest: "",
+            todos: [
+              { text: "读代码", status: "done" },
+              { text: "列风险", status: "doing" },
+              { text: "写方案", status: "pending" },
+            ],
+            todo_done: 1,
+            todo_total: 3,
+          },
+        ],
+      },
+      () => undefined,
+      (name) => (name === "军师" ? "a_js" : undefined),
+    );
+    expect(view.live).toHaveLength(1);
+    expect(view.live[0]).toMatchObject({ ownerID: "a_js", current: "正在思考" });
+    expect(view.live[0]!.todos.map((todo) => todo.text)).toEqual(["读代码", "列风险", "写方案"]);
+  });
+});
+
 describe("status step line", () => {
   it("counts live steps from one and totals a finished task", () => {
     expect(statusStepLine({ owner: "a1", title: "t", status: "running", step: 0, current: "查资料", latest: "", waiting_for: null })).toBe(

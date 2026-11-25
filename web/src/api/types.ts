@@ -221,6 +221,8 @@ export interface Action {
   confirmation?: ActionConfirmation | null;
   /** What the finished tool did, when it has something worth showing. */
   detail?: ActionDetail | null;
+  /** A ``todo_write`` call's board: the newest write's items, oldest first. */
+  todos?: ActivityTodo[] | null;
 }
 
 /** One ask inside a user message that carried several, and who takes it. */
@@ -268,9 +270,24 @@ export interface StatusCardTask {
   waiting_for: string | null;
 }
 
+/** One live work lane on a progress card: its title, step and to-do board. */
+export interface StatusCardActivity {
+  activity_id: string;
+  /** The bot's name. */
+  agent: string;
+  title: string;
+  current_step: string;
+  latest: string;
+  todos: ActivityTodo[];
+  todo_done: number;
+  todo_total: number;
+}
+
 /** The progress card the backend posts for a `status` question, with no model call per member. */
 export interface StatusCard {
   tasks: StatusCardTask[];
+  /** Work running in the group itself (not as a task thread); older cards have none. */
+  activities?: StatusCardActivity[];
   /** Members with nothing running, as ids or names. */
   idle: string[];
 }
@@ -371,10 +388,16 @@ export interface Conversation {
 }
 
 /**
- * What sending does while a reply is already running here: join the running turn, wait for
- * it to end, or stop it and answer this message instead.
+ * What sending does while a reply is already running here: answer on a lane of its own, wait
+ * for the turn to end, or stop it and answer this message instead.
  */
-export type SendMode = "steer" | "queue" | "interrupt";
+export type SendMode = "parallel" | "queue" | "interrupt";
+
+/**
+ * Which lane a run takes in its conversation. A `work` lane does the job; a `reply` lane
+ * answers a new message beside it, without interrupting what the bot is already doing.
+ */
+export type RunLane = "work" | "reply";
 
 /** A completed run the sidebar lists under 已完成 until the user opens it. */
 export interface FinishedRun {
@@ -391,6 +414,8 @@ export interface Run {
   id: string;
   conversation_id: string;
   status: RunStatus;
+  /** Which lane this run holds; a conversation can have several at once. */
+  lane: RunLane;
   current_step: string;
   error: string | null;
   model_calls: number;
@@ -411,6 +436,25 @@ export interface Run {
 /** How one bot's piece of work in one conversation ended, or that it is still going. */
 export type ActivityStatus = "running" | "awaiting" | "completed" | "stopped" | "error" | "limited";
 
+/** One item of a working lane's own todo board. */
+export type TodoStatus = "pending" | "doing" | "done" | "dropped";
+
+export interface ActivityTodo {
+  text: string;
+  status: TodoStatus;
+}
+
+/**
+ * Something a working lane heard from the group while it worked: the chatter of a reply lane
+ * (`context`), or a new requirement it should fold into its plan (`request`).
+ */
+export interface ActivityNote {
+  kind: "context" | "request";
+  text: string;
+  created_at: string;
+  source_message_id: string | null;
+}
+
 /**
  * One bot's turn as a unit: from the moment it starts answering until it writes its final
  * answer, stops or fails. In a group the chat shows one card per live activity and only the
@@ -421,7 +465,8 @@ export interface Activity {
   conversation_id: string;
   agent_id: string;
   agent_name: string;
-  run_id: string;
+  /** The run it belongs to; absent for a record whose run was removed. */
+  run_id: string | null;
   /** Set when the activity runs inside a task thread. */
   task_id: string | null;
   /** The activity that caused this one (a consult, a task, a hand-off). */
@@ -445,6 +490,13 @@ export interface Activity {
   request_message_id: string | null;
   /** Its final answer bubble; null while running or when it wrote none. */
   answer_message_id: string | null;
+  /** The lane it runs on: a reply lane answers beside the bot's working lane. */
+  lane?: RunLane;
+  /** The working lane's board, newest write first; absent when it wrote none. */
+  todos?: ActivityTodo[];
+  /** Finished items, and every item (dropped ones included); absent before a board exists. */
+  todo_done?: number;
+  todo_total?: number;
 }
 
 /** What one row of an activity's step list is. */
@@ -486,6 +538,8 @@ export interface ActivityDetail {
   conversation_title: string;
   answer: Message | null;
   sections: ActivitySection[];
+  /** What the lane heard from the group while it worked, oldest first. */
+  notes?: ActivityNote[];
 }
 
 /** One page of `GET /agents/{id}/activities`, newest first. */

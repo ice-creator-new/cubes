@@ -45,6 +45,7 @@ function runTrace(over: Partial<RunTrace>): RunTrace {
     conversation_id: "c1",
     status: "completed",
     current_step: "",
+    lane: "work",
     error: null,
     model_calls: 5,
     tool_calls: 3,

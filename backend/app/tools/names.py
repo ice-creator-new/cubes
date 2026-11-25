@@ -68,6 +68,10 @@ WORKFLOW_TOOLS: tuple[str, ...] = (
     WORKFLOW_RUN,
 )
 
+# The progress board: a working turn writes its to-do list, any lane may read every board.
+TODO_WRITE = "todo_write"
+TEAM_PROGRESS = "team_progress"
+
 # Talking to the user mid-run, changing one's own look, and splitting off small parallel jobs.
 ASK_USER = "ask_user"
 UPDATE_SELF = "update_self"

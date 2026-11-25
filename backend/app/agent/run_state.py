@@ -1,10 +1,11 @@
 """Per-run state, and the launch/stop coordination every entry point shares.
 
-One run per conversation is the invariant: a run reserves its conversation under a lock,
-interrupts whatever reply was running there, and the scheduler's fires go through the same
-path so they can never touch a run the user started. One run may still serve several bot turns
-at once — a workflow's parallel branches — so the turn being served is a context variable: it
-belongs to the task that set it, and a sibling task never sees it.
+A conversation may have several live lanes: the work lane doing the job, and reply lanes
+answering newer user messages beside it. Every lane reserves its slot under the same
+conversation lock, so the scheduler's fires can never touch a run the user started. One run
+may still serve several bot turns at once — a workflow's parallel branches — so the turn
+being served is a context variable: it belongs to the task that set it, and a sibling task
+never sees it.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from __future__ import annotations
 import asyncio
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 from fastapi import HTTPException
 
@@ -21,10 +22,15 @@ from .. import models
 from .. import workflows as workflow_rules
 from ..errors import EngineBusy, WorkflowBusy
 from ..constants import STEP_QUEUED, STEP_STOPPED
+from ..providers import resolve_model
 from ..store import Store, now_iso
 
-# A new message waits this long for the reply it interrupts to wind down, then cancels it.
+# A new message waits this long for the lanes it interrupts to wind down, then cancels them.
 INTERRUPT_STOP_TIMEOUT = 3.0
+# A conversation may run this many lanes at once: the work itself and replies beside it.
+LANES_PER_GROUP = 4
+# One bot may hold at most this many: its work lane and one reply lane.
+LANES_PER_BOT = 2
 
 
 def resolve_send_mode(store: Store, conversation: dict, running: dict | None) -> str:
@@ -41,8 +47,16 @@ def resolve_send_mode(store: Store, conversation: dict, running: dict | None) ->
         agent_id = running.get("current_agent_id")
     agent = store.get_agent(agent_id) if agent_id else None
     if agent is not None and agent.get("send_mode"):
-        return str(agent["send_mode"])
-    return str(store.team_settings()["send_mode"])
+        return _send_mode(agent["send_mode"])
+    return _send_mode(store.team_settings()["send_mode"])
+
+
+def _send_mode(value: Any) -> str:
+    """The mode a stored value means now: ``steer`` joined a turn, which is ``parallel``."""
+    mode = str(value or "").strip()
+    if mode == "steer":
+        return "parallel"
+    return mode if mode in ("parallel", "queue", "interrupt") else "parallel"
 
 
 # The bot turn the current task is serving (see ``ActiveRun.turn``). Each task — and each
@@ -94,6 +108,9 @@ class TurnBudget:
     model_calls: int = 0
     tool_calls: int = 0
     computer_steps: int = 0
+    # Lookups this turn spent as a reply lane. Counted apart from ``tool_calls`` so the
+    # reply cap ignores ``start_task`` and the sandbox, which it does not charge for.
+    reply_calls: int = 0
     # ``ask_user`` ran in this turn: a reply that stops on a lead-in needs no nudge then.
     asked: bool = False
     wrap_pending: bool = False
@@ -171,9 +188,14 @@ class ActiveRun:
     # Bots whose turn ran out of its own budget this run, by agent id: said out loud in the
     # result that asked for them, so "no reply" never reads as "it chose not to answer".
     turn_limited: dict[str, str] = field(default_factory=dict)
-    # Messages the user steered into this run, oldest first. Each is already saved in the
-    # transcript; the loop hands it to the model at its next call boundary, never mid-stream.
-    steers: list[dict] = field(default_factory=list)
+    # ``work`` runs the job itself; ``reply`` answers a new user message beside it.
+    lane: str = "work"
+    # Notes another lane left for this one, oldest first. Each is already saved as an
+    # ``activity_notes`` row; the loop hands it to the model at its next call boundary.
+    notes: list[dict] = field(default_factory=list)
+    # A reply lane on a CLI-engine bot runs on this HTTP model instead: a CLI session is a
+    # whole coding turn of its own, so two of them must never share one bot at once.
+    model_override: Any = None
     # ``group_transfer`` calls waiting to be queued: (task_id, new owner id, note).
     transfers: list[tuple[str, str, str]] = field(default_factory=list)
     # The slots still waiting their turn, as last published: (agent_id, reply_to_id).
@@ -197,14 +219,10 @@ class ActiveRun:
     # caused it after the group turn has long finished.
     activity_parent: str | None = None
 
-    def take_steers(self) -> list[dict]:
-        """Hand over every steer waiting now, so each reaches the model exactly once."""
-        taken, self.steers = self.steers, []
+    def take_notes(self) -> list[dict]:
+        """Hand over every note waiting now, so each reaches the model exactly once."""
+        taken, self.notes = self.notes, []
         return taken
-
-    def keep_steers_after(self, seq: int) -> None:
-        """Drop steers a just-built request already contains; keep only newer ones."""
-        self.steers = [message for message in self.steers if int(message["seq"]) > seq]
 
     @property
     def turn(self) -> TurnBudget | None:
@@ -244,8 +262,11 @@ class RunLauncher:
             return
         # No in-process task owns this run any more: fail it explicitly instead of
         # leaving the conversation permanently busy.
+        # Only this run's rows: another lane in the same conversation keeps streaming.
         self._store.interrupt_messages(
-            self._store.streaming_message_ids(current["conversation_id"])
+            self._store.streaming_message_ids(
+                current["conversation_id"], current["id"]
+            )
         )
         self._store.interrupt_actions(run_id, "任务已停止。")
         self._store.update_run(
@@ -263,22 +284,92 @@ class RunLauncher:
                 str(activity["id"]), status="stopped", summary="已停下：任务已停止。"
             )
 
-    async def _heal(self, conversation_id: str) -> dict | None:
-        """Make the engine and the database agree on this chat's run; answer the live row.
+    async def _heal(self, conversation_id: str) -> list[dict]:
+        """Make the engine and the database agree on this chat's lanes; answer the live rows.
 
         Two ways they drift apart, and either one used to lock a chat for good: a row still
-        marked running with no task behind it (every send queued behind a run that would
+        marked running with no task behind it (every send queued behind a lane that would
         never end), and a task still working whose row was ended elsewhere (every send
         refused as busy, and Stop did nothing because the row already said stopped).
         """
-        running = self._store.active_run(conversation_id)
-        if running is not None and self._engine.live_run(running["id"]) is None:
-            await self.finish_stop(running["id"], timeout=INTERRUPT_STOP_TIMEOUT)
-            running = None
-        stray = self._engine.live_run_in(conversation_id)
-        if stray is not None and (running is None or running["id"] != stray.run_id):
-            await self._engine.stop(stray.run_id, timeout=INTERRUPT_STOP_TIMEOUT)
-        return running
+        rows = self._store.active_runs_in(conversation_id)
+        for row in rows:
+            if self._engine.live_run(row["id"]) is None:
+                await self.finish_stop(row["id"], timeout=INTERRUPT_STOP_TIMEOUT)
+        rows = [
+            row
+            for row in self._store.active_runs_in(conversation_id)
+            if self._engine.live_run(row["id"]) is not None
+        ]
+        known = {row["id"] for row in rows}
+        for stray in self._engine.live_lanes(conversation_id):
+            if stray.run_id not in known:
+                await self._engine.stop(stray.run_id, timeout=INTERRUPT_STOP_TIMEOUT)
+        return rows
+
+    def _target_agent_id(
+        self, conversation: dict, mentions: Sequence[str], rows: Sequence[dict]
+    ) -> str | None:
+        """The bot a send will most likely meet, for the per-bot lane cap.
+
+        A direct chat or a task thread has exactly one owner. In a group the dispatcher
+        decides inside the reply lane, so this is the bot the user named when there is one,
+        else the bot the work lane is speaking through right now.
+        """
+        owner = self._owner_of(conversation)
+        if owner is not None:
+            return str(owner["id"])
+        if conversation.get("kind") != "group":
+            return None
+        if len(mentions) == 1:
+            return str(mentions[0])
+        for row in rows:
+            if row.get("lane") != "reply" and row.get("current_agent_id"):
+                return str(row["current_agent_id"])
+        for row in rows:
+            if row.get("current_agent_id"):
+                return str(row["current_agent_id"])
+        return None
+
+    def _bot_lane_count(
+        self, conversation_id: str, agent_id: str | None, rows: Sequence[dict]
+    ) -> int:
+        if agent_id is None:
+            return 0
+        return sum(
+            1
+            for row in rows
+            if str(row.get("current_agent_id") or "") == agent_id
+            or agent_id in {str(item) for item in row.get("pending_agent_ids") or []}
+        )
+
+    def _reply_model(self, agent: dict | None) -> Any:
+        """The HTTP model a CLI-engine bot answers a reply lane on, or ``None``.
+
+        A CLI session is a whole coding turn of its own; running two of them at once in one
+        bot is not safe. The backup model, else the dispatcher's model, is a plain HTTP
+        call that can answer beside the session; when neither resolves the send queues.
+        """
+        from .. import cli_engines
+        from ..providers import resolve_dispatch, resolve_fallback
+
+        if agent is None:
+            return None
+        try:
+            protocol = resolve_model(self._store, agent, self._engine._settings).protocol
+        except Exception:
+            return None
+        if protocol not in cli_engines.CLI_PROTOCOLS:
+            return None
+        for resolved in (
+            resolve_fallback(
+                self._store, self._engine._settings, agent=agent, agent_id=str(agent["id"])
+            ),
+            resolve_dispatch(self._store, self._engine._settings),
+        ):
+            if resolved is not None and resolved.protocol not in cli_engines.CLI_PROTOCOLS:
+                return resolved
+        return None
 
     async def launch(
         self,
@@ -291,40 +382,33 @@ class RunLauncher:
         schedule: dict | None = None,
         interrupt: bool = True,
         use_computer: bool = False,
-        mode: str = "interrupt",
+        mode: str = "parallel",
         addresses: list[str] | None = None,
     ) -> dict | None:
-        """Reserve and start one run; the HTTP endpoint and scheduled fires share this.
+        """Reserve and start one lane; the HTTP endpoint and scheduled fires share this.
 
-        ``mode`` is how a user send meets a reply already running here: ``steer`` joins that
-        turn — the message is saved and handed to the model at its next call boundary, never
-        mid-stream — while ``queue`` waits for a run of its own once this one ends. Any other
-        mode is the old behaviour: the running reply is stopped first (``interrupt``).
-        ``interrupt=False`` is a scheduled fire: it never touches a running run, and returns
-        ``None`` when the conversation is busy so the scheduler queues that fire instead.
+        ``mode`` is how a send meets a conversation that is already working: ``parallel``
+        (the default) runs a reply lane beside the work, ``queue`` waits for a slot, and
+        ``interrupt`` stops every live lane first. Lanes over the cap queue instead of
+        interrupting anything. ``interrupt=False`` is a scheduled fire: it never touches a
+        running lane, and returns ``None`` when the conversation is busy.
         """
         lock = self._locks.setdefault(conversation["id"], asyncio.Lock())
         async with lock:
-            running = await self._heal(conversation["id"])
+            rows = await self._heal(conversation["id"])
             # Checked under the lock: two sends of one upload can never both bind it.
             if self._store.unbound_attachments(attachment_ids or []) is None:
                 raise HTTPException(status_code=422, detail=attachment_rules.STALE)
-            if running is not None:
-                if mode == "steer" and interrupt:
-                    joined = self._join_running(
-                        conversation,
-                        running,
-                        content=content,
-                        mentions=mentions,
-                        reply_to_id=reply_to_id,
-                        attachment_ids=attachment_ids,
-                    )
-                    if joined is not None:
-                        return joined
-                    # This bot drives its own CLI session: a message cannot join its turn,
-                    # so it waits like any other.
-                    mode = "queue"
-                if mode == "queue":
+            mode = _send_mode(mode)
+            interrupted = bool(rows) and mode == "interrupt"
+            if rows:
+                if not interrupt:
+                    return None
+                if mode == "interrupt":
+                    for row in rows:
+                        await self.finish_stop(row["id"], timeout=INTERRUPT_STOP_TIMEOUT)
+                    rows = []
+                elif mode == "queue":
                     return self._queue_send(
                         conversation,
                         content=content,
@@ -332,12 +416,49 @@ class RunLauncher:
                         reply_to_id=reply_to_id,
                         attachment_ids=attachment_ids,
                         addresses=addresses,
+                        lane="reply" if any(r.get("lane") != "reply" for r in rows) else "work",
                     )
-                if not interrupt:
-                    return None
-                await self.finish_stop(running["id"], timeout=INTERRUPT_STOP_TIMEOUT)
-            # A send already waiting keeps its place: a later one queues behind it rather than
-            # overtaking it. An explicit interrupt is the exception — the user asked to speak now.
+            lane = "work" if not any(r.get("lane") != "reply" for r in rows) else "reply"
+            model_override = None
+            target = self._target_agent_id(conversation, mentions, rows)
+            if (
+                len(rows) >= LANES_PER_GROUP
+                or self._bot_lane_count(conversation["id"], target, rows) >= LANES_PER_BOT
+            ):
+                return self._queue_send(
+                    conversation,
+                    content=content,
+                    mentions=mentions,
+                    reply_to_id=reply_to_id,
+                    attachment_ids=attachment_ids,
+                    addresses=addresses,
+                    lane=lane,
+                )
+            if lane == "reply":
+                agent = self._store.get_agent(target) if target else None
+                model_override = self._reply_model(agent)
+                try:
+                    primary = resolve_model(
+                        self._store, agent, self._engine._settings
+                    ) if agent is not None else None
+                except Exception:
+                    primary = None
+                from .. import cli_engines
+
+                if primary is not None and primary.protocol in cli_engines.CLI_PROTOCOLS:
+                    if model_override is None:
+                        # A CLI bot cannot run two sessions: this send waits its turn.
+                        return self._queue_send(
+                            conversation,
+                            content=content,
+                            mentions=mentions,
+                            reply_to_id=reply_to_id,
+                            attachment_ids=attachment_ids,
+                            addresses=addresses,
+                            lane="reply",
+                        )
+            # A queued send keeps its place: a later one queues behind it rather than
+            # overtaking it. An explicit interrupt is the exception — the user spoke now.
             if mode != "interrupt" and self._store.queued_run(conversation["id"]) is not None:
                 return self._queue_send(
                     conversation,
@@ -346,6 +467,7 @@ class RunLauncher:
                     reply_to_id=reply_to_id,
                     attachment_ids=attachment_ids,
                     addresses=addresses,
+                    lane=lane,
                 )
             # No await between here and reserving the run: nothing else can start one.
             run, message = self._store.begin_run(
@@ -353,10 +475,11 @@ class RunLauncher:
                 content,
                 mentions,
                 reply_to_id=reply_to_id,
-                interrupts=running is not None,
+                interrupts=interrupted,
                 attachment_ids=attachment_ids,
                 schedule=schedule,
                 addresses=addresses,
+                lane=lane,
             )
             # A walk parked on a question takes this message as its answer: the run picks the
             # walk up from its rows, so asking on the page and answering on the page are one
@@ -392,6 +515,8 @@ class RunLauncher:
                     # A schedule the user marked may use the sandbox skips the consent card.
                     computer_allowed=bool(use_computer) and schedule is not None,
                     workflow_run_id=workflow_run["id"] if workflow_run is not None else None,
+                    lane=lane,
+                    model_override=model_override,
                 )
             except EngineBusy as exc:  # pragma: no cover - healed under the lock above
                 # Nothing started: take the message back, so a retry never leaves a copy.
@@ -404,7 +529,7 @@ class RunLauncher:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         return self._store.get_run(run["id"]) or run
 
-    # ------------------------------------------------------------------ steers
+    # ------------------------------------------------------------------ queues
 
     def _owner_of(self, conversation: dict | None) -> dict | None:
         """The bot a direct chat or a task thread belongs to; ``None`` for a group or walk."""
@@ -424,6 +549,7 @@ class RunLauncher:
         reply_to_id: str | None,
         attachment_ids: list[str] | None,
         addresses: list[str] | None = None,
+        lane: str = "reply",
     ) -> dict:
         """Write the message as queued and tell every window, without starting anything."""
         queued, message = self._store.begin_queued_run(
@@ -433,64 +559,10 @@ class RunLauncher:
             reply_to_id=reply_to_id,
             attachment_ids=attachment_ids,
             addresses=addresses,
+            lane=lane,
         )
         self._engine.publish("message_end", models.message_payload(message))
         return queued
-
-    def _steerable(self, agent: dict) -> bool:
-        """Whether a message can join this bot's running turn mid-reply.
-
-        A CLI engine runs its own session around a fixed prompt: the only place to add a
-        message is a new turn, so such a bot queues the steer instead.
-        """
-        from .. import cli_engines
-        from ..providers import resolve_model
-
-        try:
-            protocol = resolve_model(self._store, agent, self._engine._settings).protocol
-        except Exception:
-            # No resolvable model this instant: worse to lose the message than to queue it.
-            return False
-        return protocol not in cli_engines.CLI_PROTOCOLS
-
-    def _join_running(
-        self,
-        conversation: dict,
-        running: dict,
-        *,
-        content: str,
-        mentions: list[str],
-        reply_to_id: str | None,
-        attachment_ids: list[str] | None,
-    ) -> dict | None:
-        """Save the message and hand it to the live run; ``None`` when it cannot join.
-
-        Nothing awaits between the liveness check and the hand-off, so a run that ends here
-        can never swallow the message: it either joins the turn or the caller queues it.
-        """
-        owner = self._owner_of(conversation)
-        if owner is None:
-            # A group has no single owner: the bot taking the turn right now is the one that
-            # reads the steer. Between turns there is nobody to tell, so it waits instead.
-            owner = (
-                self._store.get_agent(running["current_agent_id"])
-                if running.get("current_agent_id")
-                else None
-            )
-        if owner is None or not self._steerable(owner):
-            return None
-        active = self._engine.live_run(running["id"])
-        if active is None:
-            return None
-        message = self._store.append_user_message(
-            conversation["id"],
-            content,
-            mentions,
-            reply_to_id=reply_to_id,
-            attachment_ids=attachment_ids,
-        )
-        self._engine.steer(active, message)
-        return self._store.get_run(running["id"]) or running
 
     # ------------------------------------------------------------------ workflows
 
@@ -583,14 +655,19 @@ class RunLauncher:
         """
         lock = self._locks.setdefault(conversation_id, asyncio.Lock())
         async with lock:
-            if await self._heal(conversation_id) is not None:
-                return
+            rows = await self._heal(conversation_id)
             conversation = self._store.get_conversation(conversation_id)
             if conversation is None:
                 return
-            queued = self._store.queued_run(conversation_id)
-            if queued is not None:
-                await self._start_queued(conversation, queued)
+            while self._store.queued_run(conversation_id) is not None:
+                rows = self._store.active_runs_in(conversation_id)
+                if len(rows) >= LANES_PER_GROUP:
+                    return
+                queued = self._store.queued_run(conversation_id)
+                assert queued is not None
+                if not await self._start_queued(conversation, queued):
+                    return
+            if rows:
                 return
             walk = self._store.queued_workflow_run(conversation_id)
             if walk is None:
@@ -620,21 +697,41 @@ class RunLauncher:
                 return
             self._publish_workflow_run(walk["id"])
 
-    async def _start_queued(self, conversation: dict, queued: dict) -> None:
-        """Promote one queued send into a normal run answering the message it already wrote."""
+    async def _start_queued(self, conversation: dict, queued: dict) -> bool:
+        """Promote one queued send if its lane and bot still have room; True when started."""
+        rows = self._store.active_runs_in(conversation["id"])
+        lane = str(queued.get("lane") or "work")
+        if lane == "work" and any(r.get("lane") == "work" for r in rows):
+            lane = "reply"
+        target = self._target_agent_id(conversation, list(queued.get("mentions") or []), rows)
+        if self._bot_lane_count(conversation["id"], target, rows) >= LANES_PER_BOT:
+            return False
+        model_override = None
+        if lane == "reply":
+            agent = self._store.get_agent(target) if target else None
+            model_override = self._reply_model(agent)
         promoted = self._store.promote_queued_run(queued["id"])
         if promoted is None:  # pragma: no cover - looked up under this conversation's lock
-            return
+            return False
         run, message = promoted
         self._store.update_run(
-            run["id"], current_agent_id=self._engine.first_responder(conversation, message)
+            run["id"],
+            current_agent_id=self._engine.first_responder(conversation, message),
+            lane=lane,
         )
         try:
-            self._engine.start(run["id"], conversation["id"], message_id=message["id"])
+            self._engine.start(
+                run["id"],
+                conversation["id"],
+                message_id=message["id"],
+                lane=lane,
+                model_override=model_override,
+            )
         except EngineBusy:  # pragma: no cover - the slot was free under the lock
             self._store.update_run(run["id"], status="queued", current_step=STEP_QUEUED)
-            return
+            return False
         self._engine.publish("message_end", models.message_payload(message))
+        return True
 
     async def fire_scheduled(self, schedule: dict, text: str = "") -> dict | None:
         """Start one scheduled run in its hidden workspace; ``None`` while that is busy.
@@ -656,7 +753,7 @@ class RunLauncher:
         workspace = self._store.ensure_background_conversation(
             schedule, owner_id=owner["id"], purpose=target["title"]
         )
-        if self._store.active_run(workspace["id"]) is not None:
+        if self._store.active_runs_in(workspace["id"]):
             return None
         # Every fire starts from a blank page: the previous one's history is not context.
         self._store.reset_conversation(workspace["id"])
@@ -689,7 +786,7 @@ class RunLauncher:
             return None
         lock = self._locks.setdefault(target["id"], asyncio.Lock())
         async with lock:
-            if await self._heal(target["id"]) is not None:
+            if await self._heal(target["id"]):
                 return None
             note = schedule["prompt"].strip()
             run, message = self._store.begin_run(

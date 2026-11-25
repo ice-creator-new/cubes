@@ -7,7 +7,7 @@
 | 接口 | 用途 |
 | --- | --- |
 | `GET /health` | 本地服务和默认模型的状态：`configured`、`model`、`base_url`、`provider_name`、`configuration_error`、`auth`，不返回密钥 |
-| `GET /workspace` | 负责人、成员、会话和正在运行的任务（`active_runs`）；`onboarded` 为 false 时客户端显示首次见面页 |
+| `GET /workspace` | 负责人、成员、会话和正在运行的任务（`active_runs`；同一会话可以同时有 `lane` 为 `work` 和 `reply` 的多条线）；`onboarded` 为 false 时客户端显示首次见面页 |
 | `POST /onboarding` | 首次见面 `{name, appearance?}`：给负责人改名、存下外观（和 `PATCH /agents/{id}` 用同一套校验），把负责人私聊标题一起改掉，置 `meta.onboarded` 并推送 `workspace` 事件；重名 409，外观非法 422 |
 | `GET /providers` | 全部模型服务、默认模型和备用模型；每个服务只返回 `api_key_hint`（形如 `sk-…abcd`），永远不返回 key。`model_caps` 是每个列出模型的解析结果 `{模型: {images, video, audio, pdf, context_window, max_output, reasoning, reasoning_levels, sources}}`，`sources` 的每个字段是 `user` / `provider` / `catalog` / `default` 之一，说明这个值是从哪一层来的；`model_overrides` 是用户自己的 `{模型 或 "*": {images, context, output}}`。CLI 协议还会带 `model_details`：每个模型在这台机器上的 `label`、`description`、`efforts`、`default_effort` 和 `current`（CLI 当前配置的是不是它），读一次缓存 60 秒，读不到就是空数组。`engines` 是两个本机 CLI 的状态 `{kind, label, installed, ready, detail, command, version}`，读起来不花模型额度 |
 | `POST /providers` | 新建模型服务（OpenAI 兼容、Anthropic Messages，或 `claude-code` / `codex`）；重名返回 409，字段非法返回 422（中文）；表里第一个服务自动成为默认。HTTP 协议建好后会顺手读一次它的 `GET /models`，把图像/视频/音频、窗口、输出上限和思考能力存成服务商那一层；读不到不影响创建。CLI 协议不需要地址和 key：模型列表是「默认」加上这台机器上 CLI 报告的全部模型（新建时自动读一次，读不到就只有「默认」） |
@@ -22,11 +22,13 @@
 | `GET /events?conversation_id=` | 工作区 SSE；先发 `snapshot`，之后推送所有任务的实时事件，连接不会自己结束 |
 | `GET /conversations/{id}` | 一个会话的全部消息；带 `limit`（1 到 200）时只返回最新的一页：`before` 给出消息 `seq` 则返回比它更早的，按时间正序，并带 `has_more`（还有更早的）和 `references`（这一页引用的、但不在页内的被回复消息，供引用行显示）。不带 `limit` 时消息全量返回，`has_more` 为 false、`references` 为空。定时任务的后台会话按不存在处理（404） |
 | `POST /conversations/{id}/read` | 记住这个会话已经读到哪条消息 `{seq}`；之后新到的机器人回复才算未读，侧栏圆点清掉，并推送 `workspace` |
-| `POST /conversations/{id}/runs` | 启动任务，可带 `mentions` 和 `reply_to_id`（回复某条成员消息；不存在、不在本会话或不是成员消息时返回 422）。`mode` 决定会话正在回复时这条消息怎么办：`steer` 把它交给正在进行的这一轮，机器人在下一次模型调用时看到，同一轮里接着回答；`queue` 先存成一条 `status: "queued"` 的消息和一次 `status: "queued"` 的运行，等这一轮结束后自己开始；`interrupt` 停下当前回复再回答新消息。不传时按这位成员的 `send_mode`、再按团队的 `send_mode` 决定；带图片的 `steer` 会按 `queue` 处理。返回这次消息对应的运行（排队时 `status` 是 `queued`） |
+| `POST /conversations/{id}/runs` | 启动一次发送，可带 `mentions` 和 `reply_to_id`（回复某条成员消息；不存在、不在本会话或不是成员消息时返回 422）。`mode` 决定会话已经在工作时这条消息怎么办：`parallel`（默认）在正在做的工作线旁边另开一条回复线，工作线不停；`queue` 先存成一条 `status: "queued"` 的消息和一次 `status: "queued"` 的运行，等有空位再开始；`interrupt` 停下当前所有线再回答新消息。一个会话最多 4 条线，每位成员最多 2 条，超过就排队。不传时按这位成员的 `send_mode`、再按团队的 `send_mode` 决定（旧的 `steer` 已迁移为 `parallel`）。返回这次消息对应的运行，带 `lane`（`work` 或 `reply`；排队时 `status` 是 `queued`） |
 | `DELETE /runs/{id}` | 撤回一条还在排队的发送：删掉那条消息和它的运行，推送 `message_removed`；已经开始或已结束的运行返回 409，不存在返回 404 |
 | `POST /conversations/{id}/messages/{mid}/edit` | 改一条自己发的消息 `{content}`：删掉这一条和它后面的全部内容（连带工具行、图片绑定、摘要、只存在于后半段的运行），按新文本重新开始一次任务并把这条消息原来的图片带过去；不是自己的消息或行动行 422，会话正在运行 409，私聊 403，没有这条消息 404。返回新任务 |
 | `POST /conversations/{id}/messages/{mid}/rewind` | 删掉这条消息之后的全部内容，这条保留；会话正在运行 409。返回这个会话剩下的全部消息（`has_more` 为 false），其他窗口收到 `message_removed` 与 `workspace` |
 | `POST /conversations/{id}/messages/{mid}/reroute` | 重新派发一条自己发的群消息 `{speakers: [成员 id]}`：正在回答它的运行先停下，再用这几位重新回答，不新写用户消息；这条消息的 `route` 改成 `by: "user"`，`intents` 清掉。不是群组 400、不是自己的消息 422、有人不在群里 422、这条还在排队 409、会话正忙 409。返回新运行 |
+| `GET /conversations/{id}/tasks` | 这个聊天开的任务（群组和私聊都算），最新在前：负责人、状态、线程、步骤、卡片消息和最近几步；不存在或不是群组/私聊返回 404 |
+| `POST /conversations/{id}/tasks/{task_id}/now` | 「现在就做」：让一条排队中的任务不等这位成员手上的活，立刻在自己的线程里开始（放开这一位成员的并行限制；聊天的 4 条线、团队同时任务数仍要放得下）。返回启动后的任务；不在排队、线程正忙、聊天或团队已经满了返回 409，聊天里没有这个任务返回 404 |
 | `POST /conversations/{id}/invite` | 确认一条通知上的「拉进群」`{agent_id, message_id?, notice_id?}`：把成员加进群并发一行「已把 X 拉进群」，清掉那条通知的 `invite`；带 `message_id` 时启动一次运行，让这位成员回答那条被 @ 的消息（`route_override` 只有它）。不是群组或成员不存在 404、群正在回复 409。返回这次运行 |
 | `GET /webhooks?target_kind=&target_id=` | 一个定时任务或工作流名下的 Webhook（`{webhook: {id, target_kind, target_id, path, created_at, last_called_at}}`，没有时是 `null`）；永远不带密钥 |
 | `POST /webhooks` | 给一个目标创建 Webhook `{target_kind: "schedule"\|"workflow", target_id}`；返回里带唯一的 `secret`（只此一次）；目标不存在 404，已经有 Webhook 409 |
@@ -49,13 +51,13 @@
 | `POST /workflow-runs/{id}/stop` | 停止并结束这次运行 |
 | `POST /workflow-runs/{id}/answer` | 回答 `ask_user` 那一步 `{input}`，它就成为该步的产出并继续；没在等你回答时 409 |
 | `POST /workflow-runs/{id}/nodes/{node_id}/{retry\|skip}` | 重跑或跳过某个节点（路径里也可以写序号，按这次运行的图解析）；活着的运行在节点边界生效，停着时直接改行 |
-| `GET /runs/{id}` | 任务详情：状态、当前步骤、模型/工具调用次数、排队和接力位置，以及本次任务的 token 用量 `input_tokens`、`output_tokens`、`cached_tokens`（模型服务报告的所有调用之和，模型不报告时为 0）和压缩次数 `compactions` |
+| `GET /runs/{id}` | 任务详情：状态、当前步骤、模型/工具调用次数、排队和接力位置，以及本次任务的 token 用量 `input_tokens`、`output_tokens`、`cached_tokens`（模型服务报告的所有调用之和，模型不报告时为 0）和压缩次数 `compactions`，以及 `lane`（`work`/`reply`） |
 | `POST /runs/{id}/stop` | 停止任务，保留已生成内容 |
 | `POST /agents` | 新增成员；重名返回 409 |
-| `PATCH /agents/{id}` | 修改成员名称、职责、外观和模型；`appearance` 含 `shape`、`color` 和可选的 `eye`：`color` 是目录里的颜色或任意 `#rrggbb`，`eye` 是任意 `#rrggbb`，不传或传 null 时自动挑一个和身体对比清楚的眼睛颜色；`appearance` 传 null 时恢复默认外观；旧的 `expression` 字段会被接收、校验后丢弃；`model_ref` 为 `{provider_id, model}` 或 null（跟随默认），指向不存在的服务或不在列表里的模型时返回 422；CLI 协议还可带 `effort`（思考强度，必须是该模型支持的档位，否则 422），成员返回值带 `model_status`（`default`/`custom`/`fallback`）；`send_mode` 是这位成员忙时你发的消息怎么处理（`steer` / `queue` / `interrupt`，null 跟随团队的 `send_mode`）；重名返回 409 |
+| `PATCH /agents/{id}` | 修改成员名称、职责、外观和模型；`appearance` 含 `shape`、`color` 和可选的 `eye`：`color` 是目录里的颜色或任意 `#rrggbb`，`eye` 是任意 `#rrggbb`，不传或传 null 时自动挑一个和身体对比清楚的眼睛颜色；`appearance` 传 null 时恢复默认外观；旧的 `expression` 字段会被接收、校验后丢弃；`model_ref` 为 `{provider_id, model}` 或 null（跟随默认），指向不存在的服务或不在列表里的模型时返回 422；CLI 协议还可带 `effort`（思考强度，必须是该模型支持的档位，否则 422），成员返回值带 `model_status`（`default`/`custom`/`fallback`）；`send_mode` 是这位成员忙时你发的消息怎么处理（`parallel` / `queue` / `interrupt`；旧值 `steer` 迁移为 `parallel`。null 跟随团队的 `send_mode`）；重名返回 409 |
 | `POST /agents/{id}/direct` | 幂等返回该成员的私聊会话 |
-| `GET /agents/{id}/activities` | 这位成员的工作记录：每次发言（一轮活动）的最新在前，可按 `started_at` 用 `before` 往前翻（`limit` 默认 50），返回 `{activities, has_more}`；每条带标题、结论、状态、当前步骤、步数、起止时间和最终的答复消息 id |
-| `GET /activities/{id}` | 一条活动的详情：`activity`（同上）、`conversation_title`、`answer`（最终答复消息，可能为 null）和 `sections`——先是这一轮自己，再是它问过的同事或开出的任务线程；每个分组带 `messages`（这一轮写下的全部消息，格式与会话接口相同、从旧到新，含工具详情和附件）和 `steps`（每步带 `kind`（`tool`/`note`/`ask`/`handoff`）、`title`、`subtitle`、`status`、`message_id`、`action_id` 和指向分组的 `target_activity_id`）；不存在返回 404「这条记录不存在。」。运行中靠 `activity` 事件更新（每秒最多一次，状态一变立刻推） |
+| `GET /agents/{id}/activities` | 这位成员的工作记录：每次发言（一轮活动）的最新在前，可按 `started_at` 用 `before` 往前翻（`limit` 默认 50），返回 `{activities, has_more}`；每条带标题、结论、状态、当前步骤、步数、起止时间和最终的答复消息 id，以及 `todos`、`todo_done`、`todo_total` 和 `lane` |
+| `GET /activities/{id}` | 一条活动的详情：`activity`（同上）、`conversation_title`、`answer`（最终答复消息，可能为 null）、`notes`（别的线给这条工作留下的备注，`{kind,text,source_message_id,created_at}`，`kind` 为 `context`/`request`）和 `sections`——先是这一轮自己，再是它问过的同事或开出的任务线程；每个分组带 `messages`（这一轮写下的全部消息，格式与会话接口相同、从旧到新，含工具详情和附件）和 `steps`（每步带 `kind`（`tool`/`note`/`ask`/`handoff`）、`title`、`subtitle`、`status`、`message_id`、`action_id` 和指向分组的 `target_activity_id`）；不存在返回 404「这条记录不存在。」。运行中靠 `activity` 事件更新（每秒最多一次，状态一变立刻推） |
 | `DELETE /agents/{id}` | 删除成员及其私聊；主管（409）、正在回复的成员（409）、不存在的成员（404）会被拒绝。删除后推送 `workspace` 与 `sidebar` 事件 |
 | `POST /actions/{id}/confirm` | 回答等待中的行动（如删除成员）：`approve` 为 true 表示同意；再加 `always: true` 表示这次同意并记住一条规则，以后这位成员的同种操作不再出卡。返回处理后的行动；已处理过返回 409 |
 | `GET /approval-rules` | 已记住的「总是允许」规则：工具名、中文名 `title`、成员和创建时间 |

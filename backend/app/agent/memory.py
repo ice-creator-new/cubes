@@ -131,7 +131,7 @@ class MemoryExtraction:
     def _start_memory_flush(self, conversation_id: str) -> None:
         self._memory_timers.pop(conversation_id, None)
         # A reply still running here will park another turn when it ends; read them together.
-        if conversation_id in self._runs:
+        if self.is_running(conversation_id):
             self._arm_memory_flush(conversation_id, delay=self._settings.memory_idle_seconds)
             return
         task = asyncio.create_task(self._flush_memory_turns(conversation_id))

@@ -1,4 +1,4 @@
-"""Steering a running turn and queueing a send."""
+"""Queueing a send, interrupting, and the send mode a message without one carries."""
 
 from __future__ import annotations
 
@@ -9,94 +9,15 @@ from helpers import (
     client_for,
     get_conversation,
     get_workspace,
-    last_user_text,
     start_run,
     store_of,
     wait_for_message,
     wait_for_run,
 )
 
-STEER_PREFIX = "（这条消息是在你这一轮还没做完时插进来的"
-
 
 def user_messages(detail: dict) -> list[dict]:
     return [message for message in detail["messages"] if message["kind"] == "user"]
-
-
-# ------------------------------------------------------------------ steer
-
-
-def test_a_steer_reaches_the_next_model_call_of_the_same_run(make_backend, upstream) -> None:
-    """The default choice while a reply streams: it joins the turn, nothing is restarted."""
-    upstream.chunk_delay = 0.1
-    upstream.chunk_count = 8
-    upstream.script = [{"content": None, "slow": True}, {"content": "好，改成第二个题目。"}]
-    backend = make_backend()
-
-    async def body() -> None:
-        async with client_for(backend) as client:
-            direct_id = (await get_workspace(client))["direct_conversation_id"]
-            first = await start_run(client, direct_id, "写一篇长文")
-            await wait_for_message(client, direct_id, status="streaming")
-            await asyncio.sleep(0.2)
-
-            steered = await client.post(
-                f"/conversations/{direct_id}/runs",
-                json={"content": "换个题目，写第二个", "mode": "steer"},
-            )
-            assert steered.status_code == 202, steered.text
-            # The steer joined the live run instead of starting another one.
-            assert steered.json()["id"] == first["id"]
-            assert steered.json()["status"] == "running"
-
-            finished = await wait_for_run(client, first["id"])
-            assert finished["status"] == "completed"
-            # One run, two model calls: the first reply ended, then the steer was answered.
-            assert upstream.request_count == 2
-
-            detail = await get_conversation(client, direct_id)
-            assert [m["content"] for m in user_messages(detail)] == ["写一篇长文", "换个题目，写第二个"]
-            assert [m["status"] for m in user_messages(detail)] == ["complete", "complete"]
-            replies = agent_messages(detail)
-            assert replies[-1]["content"] == "好，改成第二个题目。"
-
-        # The second request of that same run saw the reply so far and the steer as a user turn.
-        second = upstream.request(1)
-        assert second["messages"][-1]["role"] == "user"
-        latest = last_user_text(second)
-        assert latest.startswith(STEER_PREFIX)
-        assert "换个题目，写第二个" in latest
-        assert any(
-            message["role"] == "assistant" and "[1]" in (message.get("content") or "")
-            for message in second["messages"]
-        )
-
-    asyncio.run(body())
-
-
-def test_a_steer_does_not_interrupt_the_reply_being_written(make_backend, upstream) -> None:
-    """No row is cut off: the streaming reply finishes and then answers the steer."""
-    upstream.chunk_delay = 0.1
-    upstream.chunk_count = 6
-    upstream.script = [{"content": None, "slow": True}, {"content": "收到补充。"}]
-    backend = make_backend()
-
-    async def body() -> None:
-        async with client_for(backend) as client:
-            direct_id = (await get_workspace(client))["direct_conversation_id"]
-            run = await start_run(client, direct_id, "写一份清单")
-            await wait_for_message(client, direct_id, status="streaming")
-            await asyncio.sleep(0.15)
-            posted = await client.post(
-                f"/conversations/{direct_id}/runs", json={"content": "再加上第三项"}
-            )
-            assert posted.status_code == 202, posted.text
-            await wait_for_run(client, run["id"])
-            replies = agent_messages(await get_conversation(client, direct_id))
-            # Neither reply was cut off, and the steer took the default mode.
-            assert [reply["status"] for reply in replies] == ["complete", "complete"]
-
-    asyncio.run(body())
 
 
 # ------------------------------------------------------------------ queue
@@ -157,7 +78,9 @@ def test_a_queued_send_can_be_taken_back(make_backend, upstream) -> None:
             removed = await client.delete(f"/runs/{queued.json()['id']}")
             assert removed.status_code == 204, removed.text
             assert (await client.get(f"/runs/{queued.json()['id']}")).status_code == 404
-            assert "这条不要了" not in [m["content"] for m in user_messages(await get_conversation(client, direct_id))]
+            assert "这条不要了" not in [
+                m["content"] for m in user_messages(await get_conversation(client, direct_id))
+            ]
 
             await client.post(f"/runs/{run['id']}/stop", json={})
 
@@ -191,8 +114,6 @@ def test_interrupt_mode_still_stops_the_running_reply(make_backend, upstream) ->
 
 # ------------------------------------------------- the mode a send without one carries
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
-
 
 async def patch_send_mode(client, mode: str) -> dict:
     response = await client.patch("/settings/team", json={"send_mode": mode})
@@ -206,7 +127,7 @@ async def supervisor_id(client) -> str:
 
 
 def test_the_team_default_answers_a_send_that_names_no_mode(make_backend, upstream) -> None:
-    """With the workspace set to 做完再发, an unlabelled send waits instead of steering."""
+    """With the workspace set to 做完再发, an unlabelled send waits."""
     upstream.chunk_delay = 0.1
     upstream.chunk_count = 6
     upstream.script = [{"content": None, "slow": True}, {"content": "第二条回复。"}]
@@ -235,39 +156,36 @@ def test_the_team_default_answers_a_send_that_names_no_mode(make_backend, upstre
 
 
 def test_a_bots_own_mode_wins_over_the_team_default(make_backend, upstream) -> None:
-    """The workspace says 做完再发; this bot is set to 插进这一轮, so the send joins instead."""
+    """The workspace says 做完再发; this bot is set to 同时回，so the send runs beside it."""
     upstream.chunk_delay = 0.1
-    upstream.chunk_count = 8
-    upstream.script = [{"content": None, "slow": True}, {"content": "好，收到补充。"}]
+    upstream.chunk_count = 40
+    upstream.mode = "slow"
     backend = make_backend()
 
     async def body() -> None:
         async with client_for(backend) as client:
             await patch_send_mode(client, "queue")
             patched = await client.patch(
-                f"/agents/{await supervisor_id(client)}", json={"send_mode": "steer"}
+                f"/agents/{await supervisor_id(client)}", json={"send_mode": "parallel"}
             )
             assert patched.status_code == 200, patched.text
-            assert patched.json()["send_mode"] == "steer"
+            assert patched.json()["send_mode"] == "parallel"
 
             direct_id = (await get_workspace(client))["direct_conversation_id"]
             first = await start_run(client, direct_id, "写一篇长文")
             await wait_for_message(client, direct_id, status="streaming")
             await asyncio.sleep(0.2)
 
-            joined = await client.post(
+            beside = await client.post(
                 f"/conversations/{direct_id}/runs", json={"content": "换个题目"}
             )
-            assert joined.status_code == 202, joined.text
-            assert joined.json()["id"] == first["id"]
-            assert joined.json()["status"] == "running"
+            assert beside.status_code == 202, beside.text
+            assert beside.json()["id"] != first["id"]
+            assert beside.json()["lane"] == "reply"
+            assert beside.json()["status"] == "running"
 
-            finished = await wait_for_run(client, first["id"])
-            assert finished["status"] == "completed"
-            assert [m["content"] for m in user_messages(await get_conversation(client, direct_id))] == [
-                "写一篇长文",
-                "换个题目",
-            ]
+            await client.post(f"/runs/{beside.json()['id']}/stop", json={})
+            await client.post(f"/runs/{first['id']}/stop", json={})
 
     asyncio.run(body())
 
@@ -281,9 +199,9 @@ def test_an_explicit_api_mode_still_wins(make_backend, upstream) -> None:
 
     async def body() -> None:
         async with client_for(backend) as client:
-            await patch_send_mode(client, "queue")
+            await patch_send_mode(client, "parallel")
             await client.patch(
-                f"/agents/{await supervisor_id(client)}", json={"send_mode": "queue"}
+                f"/agents/{await supervisor_id(client)}", json={"send_mode": "parallel"}
             )
             direct_id = (await get_workspace(client))["direct_conversation_id"]
             first = await start_run(client, direct_id, "写一篇长文")
@@ -300,41 +218,11 @@ def test_an_explicit_api_mode_still_wins(make_backend, upstream) -> None:
     asyncio.run(body())
 
 
-def test_images_still_fall_back_to_a_queue_under_steer(make_backend, upstream) -> None:
-    """A photo cannot join a request already on the wire, so it waits even on 插进这一轮."""
-    upstream.chunk_delay = 0.1
-    upstream.chunk_count = 6
-    upstream.script = [{"content": None, "slow": True}, {"content": "看到图了。"}]
-    backend = make_backend()
-
-    async def body() -> None:
-        async with client_for(backend) as client:
-            uploaded = await client.post(
-                "/attachments", content=PNG, headers={"Content-Type": "image/png"}
-            )
-            assert uploaded.status_code == 201, uploaded.text
-            direct_id = (await get_workspace(client))["direct_conversation_id"]
-            first = await start_run(client, direct_id, "写一篇长文")
-            await wait_for_message(client, direct_id, status="streaming")
-
-            waiting = await client.post(
-                f"/conversations/{direct_id}/runs",
-                json={"content": "看这张图", "attachment_ids": [uploaded.json()["id"]]},
-            )
-            assert waiting.status_code == 202, waiting.text
-            assert waiting.json()["status"] == "queued"
-
-            await client.delete(f"/runs/{waiting.json()['id']}")
-            await client.post(f"/runs/{first['id']}/stop", json={})
-
-    asyncio.run(body())
-
-
 def test_a_group_uses_the_mode_of_the_bot_speaking(make_backend, upstream) -> None:
     """In a group no single bot owns the chat: the one mid-reply decides."""
     upstream.chunk_delay = 0.1
-    upstream.chunk_count = 6
-    upstream.script = [{"content": None, "slow": True}, {"content": "第二条回复。"}]
+    upstream.chunk_count = 40
+    upstream.mode = "slow"
     backend = make_backend()
     store = store_of(backend)
     supervisor = store.supervisor()
@@ -349,21 +237,23 @@ def test_a_group_uses_the_mode_of_the_bot_speaking(make_backend, upstream) -> No
     async def body() -> None:
         async with client_for(backend) as client:
             await patch_send_mode(client, "queue")
-            patched = await client.patch(f"/agents/{supervisor['id']}", json={"send_mode": "steer"})
+            patched = await client.patch(
+                f"/agents/{supervisor['id']}", json={"send_mode": "parallel"}
+            )
             assert patched.status_code == 200, patched.text
             first = await start_run(client, group["id"], "画一张图", mentions=[member["id"]])
             # The member answers in the group itself: its streaming reply keeps the group busy.
             await wait_for_message(client, group["id"], status="streaming", kind="agent")
 
-            joined = await client.post(
+            waiting = await client.post(
                 f"/conversations/{group['id']}/runs", json={"content": "换成蓝色"}
             )
-            assert joined.status_code == 202, joined.text
+            assert waiting.status_code == 202, waiting.text
             # The member speaking has no override of its own, so the team default (queue) wins
-            # even though the supervisor — who is not talking — is set to steer.
-            assert joined.json()["status"] == "queued"
+            # even though the supervisor — who is not talking — is set to 同时回.
+            assert waiting.json()["status"] == "queued"
 
-            await client.delete(f"/runs/{joined.json()['id']}")
+            await client.delete(f"/runs/{waiting.json()['id']}")
             await client.post(f"/runs/{first['id']}/stop", json={})
 
     asyncio.run(body())

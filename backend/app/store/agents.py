@@ -206,7 +206,9 @@ class Agents:
             "tool_permissions": (
                 json.loads(row["tool_permissions"]) if row["tool_permissions"] else None
             ),
-            "send_mode": row["send_mode"] or None,
+            "send_mode": (
+                "parallel" if row["send_mode"] == "steer" else (row["send_mode"] or None)
+            ),
             "permission_mode": row["permission_mode"] or None,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],

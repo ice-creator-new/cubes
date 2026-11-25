@@ -76,6 +76,7 @@ import { PAGE_SIZE, acceptsLiveMessage, mergeNewestPage, prependOlderPage } from
 import { skillUploadContentType } from "../lib/skills";
 import type { ReplyTarget } from "../lib/turns";
 import { hasOwnReaction, toggleOwnReaction } from "../lib/reactions";
+import { applyLiveRun, laneOf, leadRun, runsIn } from "../lib/runs";
 import {
   groupThreadsFromTasks,
   mergeGroupThreadProgress,
@@ -816,8 +817,9 @@ class TeamStore {
 
   /**
    * Returns null when accepted, otherwise the message to show. The draft is kept on failure.
-   * ``mode`` decides what a send does while a reply is already running here: join it
-   * (``steer``, the default), wait for it (``queue``) or stop it (``interrupt``).
+   * ``mode`` decides what a send does while a reply is already running here: open a lane of its
+   * own (``parallel``, the default), wait for the turn to end (``queue``) or stop it
+   * (``interrupt``).
    */
   async send(
     conversationID: string,
@@ -873,19 +875,31 @@ class TeamStore {
     }
   }
 
-  async stop(conversationID: string) {
-    const run = this.runFor(conversationID);
-    if (!run || this.state.stopping[conversationID]) return;
+  /**
+   * Stop one lane (``runID``) or, when it is omitted, every lane in the conversation. Each lane
+   * stops on its own, so a chat with a working and a replying lane keeps the other one running.
+   */
+  async stop(conversationID: string, runID?: string) {
+    const runs = this.runsFor(conversationID);
+    const targets = runID === undefined ? runs : runs.filter((run) => run.id === runID);
+    if (targets.length === 0 || this.state.stopping[conversationID]) return;
     const server = this.server;
     this.set({ stopping: { ...this.state.stopping, [conversationID]: true } });
     try {
-      const stopped = await this.api.stopRun(run.id);
-      if (server !== this.server) return;
-      this.applyRun(stopped);
-      // Frames for the stopped run may never arrive: re-read what is on screen.
+      // One lane already gone must not keep the others running: each is tried on its own.
+      let failure: string | null = null;
+      for (const run of targets) {
+        try {
+          const stopped = await this.api.stopRun(run.id);
+          if (server !== this.server) return;
+          this.applyRun(stopped);
+        } catch (error) {
+          failure = errorMessage(error);
+        }
+      }
+      // Frames for the stopped runs may never arrive: re-read what is on screen.
       if (this.state.selectedID) await this.refreshDetail(this.state.selectedID);
-    } catch (error) {
-      if (server === this.server) this.set({ notice: `无法停止：${errorMessage(error)}` });
+      if (failure) this.set({ notice: `无法停止：${failure}` });
     } finally {
       if (server === this.server) {
         const stopping = { ...this.state.stopping };
@@ -1366,6 +1380,18 @@ class TeamStore {
     }
   }
 
+  /** 「现在就做」: starts a queued task beside its bot's live work, without waiting. */
+  async startTaskNow(groupID: string, taskID: string): Promise<string | null> {
+    try {
+      const body = await this.api.startTaskNow(groupID, taskID);
+      if (Array.isArray(body.tasks)) this.setGroupTasks(groupID, body.tasks);
+      else void this.loadGroupTasks(groupID);
+      return null;
+    } catch (error) {
+      return errorMessage(error);
+    }
+  }
+
   /** Stops one task's thread run, or takes a queued one out of the line. */
   async stopTask(groupID: string, taskID: string): Promise<string | null> {
     try {
@@ -1488,7 +1514,10 @@ class TeamStore {
   async locateThread(threadID: string): Promise<void> {
     if (this.state.threadGroups[threadID]) return;
     const server = this.server;
-    const groups = (this.state.workspace?.conversations ?? []).filter((c) => c.kind === "group");
+    // A task thread belongs to a group or to the user's own chat with its bot.
+    const groups = (this.state.workspace?.conversations ?? []).filter(
+      (c) => c.kind === "group" || c.kind === "direct",
+    );
     for (const group of groups) {
       let tasks = this.state.groupTasks[group.id];
       if (!tasks) {
@@ -2408,16 +2437,19 @@ class TeamStore {
     }
   }
 
-  private applyRun(run: Run) {
+  private applyRun(incoming: Run) {
     const workspace = this.state.workspace;
     if (!workspace) return;
+    // An event from an older server may leave the lane out; a missing one is ordinary work.
+    const run = { ...incoming, lane: laneOf(incoming) };
     const before = workspace.active_runs.find((item) => item.id === run.id);
     // A member taking the turn thinks first: the body becomes the middle of three dots.
     if (run.status === "running" && run.current_agent_id && before?.current_agent_id !== run.current_agent_id) {
       this.gesture(run.current_agent_id, "think");
     }
-    const others = workspace.active_runs.filter((item) => item.id !== run.id);
-    const active_runs = run.status === "running" ? [...others, run] : others;
+    // Lanes are kept as a list: a second send while one bot works opens another run, and both
+    // stay live. A lane that ended leaves the list; a running one replaces its own row.
+    const active_runs = applyLiveRun(workspace.active_runs, run);
     // A run that just finished spent tokens: refresh the team panel's totals if they are on screen.
     if (before?.status === "running" && run.status !== "running" && this.state.usage) {
       void this.loadUsage(this.state.usage.period);
@@ -2611,8 +2643,14 @@ class TeamStore {
 
   // MARK: derived
 
+  /** Every live lane of a conversation: a bot may be working and answering at once. */
+  runsFor(conversationID: string): Run[] {
+    return runsIn(this.state.workspace?.active_runs ?? [], conversationID);
+  }
+
+  /** The lane the chat's own step line follows: the working one when there is one. */
   runFor(conversationID: string): Run | undefined {
-    return this.state.workspace?.active_runs.find((run) => run.conversation_id === conversationID);
+    return leadRun(this.state.workspace?.active_runs ?? [], conversationID);
   }
 }
 
@@ -2811,8 +2849,10 @@ export function moodFor(state: TeamState, agentID: string, conversationID?: stri
       const streaming = detail.messages.find((m) => m.status === "streaming");
       if (streaming?.author_id === agentID) return "speaking";
     }
-    const run = state.workspace?.active_runs.find((r) => r.conversation_id === conversationID);
-    if (run && (run.current_agent_id === agentID || run.pending_agent_ids.includes(agentID))) return "thinking";
+    const runs = state.workspace?.active_runs.filter((run) => run.conversation_id === conversationID) ?? [];
+    if (runs.some((run) => run.current_agent_id === agentID || run.pending_agent_ids.includes(agentID))) {
+      return "thinking";
+    }
   }
   return latestReplyMood(state, agentID) ?? "idle";
 }

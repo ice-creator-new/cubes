@@ -2210,6 +2210,17 @@ button.author-line:hover .author-name {
   margin: 0;
 }
 
+/* A task card opened by this reply is the next thing in its burst, not a new speaker. The
+   reserved copy/reply row would push it 24px down, so those buttons ride the bubble's last
+   line in the right margin too and the card keeps the ordinary 10px beat. */
+.chat-scroll .column > .turn.agent:has(+ .turn.task-turn) > .turn-tools {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  height: 26px;
+  margin: 0;
+}
+
 .tool-button {
   width: 28px;
   height: 28px;
@@ -2895,6 +2906,81 @@ button.author-line:hover .author-name {
 /* A confirmation that resolved into its normal log line: the row fades in where the card was. */
 .action-block.resolved {
   animation: fade-in var(--t-fast) var(--ease);
+}
+
+/* A progress board row: the bar and its count on one line, the item being worked on under
+   it in words, so a collapsed board still says what the work is. */
+.todo-board-block {
+  min-width: 232px;
+}
+
+.todo-board-row {
+  align-items: flex-start;
+}
+
+.todo-board-row .action-icon {
+  margin-top: 1px;
+}
+
+.todo-board-summary {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.todo-board-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.todo-board-title {
+  flex: none;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+/* The bar takes the free width between the title and the count: at a glance it is a bar,
+   not a dash, and a nearly finished board is visibly nearly full. */
+.todo-board-bar {
+  flex: 1 1 auto;
+  min-width: 48px;
+  max-width: 220px;
+  height: 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink-3) 22%, transparent);
+  overflow: hidden;
+}
+
+.todo-board-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width var(--t-base) var(--ease);
+}
+
+.todo-board-count {
+  flex: none;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+}
+
+.todo-board-line {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: var(--ink-3);
+}
+
+.todo-board-detail {
+  padding-left: 14px;
 }
 
 /* The tool glyph doubles as the status light: accent while running, danger on error. */
@@ -4064,6 +4150,53 @@ button.author-line:hover .author-name {
 
 .send-button:not(:disabled):active {
   transform: scale(0.94);
+}
+
+/* The stop button's menu: one lane each, plus all of them. It is portalled to the body and
+   pinned to the button's screen point, so no frosted or masked layer can paint over it. */
+.stop-menu-anchor {
+  position: relative;
+  display: inline-flex;
+}
+.stop-menu {
+  position: fixed;
+  z-index: 60;
+  display: grid;
+  gap: 1px;
+  min-width: 176px;
+  padding: 5px;
+  border-radius: 12px;
+  background: var(--raised);
+  box-shadow: 0 0 0 1px var(--edge), var(--lift-strong);
+}
+.stop-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  white-space: nowrap;
+}
+.stop-menu-item:hover,
+.stop-menu-item:focus-visible {
+  background: var(--tint-strong);
+  color: var(--ink);
+}
+.stop-menu-item.all {
+  margin-top: 2px;
+  border-top: 1px solid var(--hairline);
+  border-radius: 0 0 8px 8px;
+  padding-top: 8px;
+  color: var(--ink-3);
+}
+.stop-menu-item svg {
+  flex: none;
 }
 
 /* Send and stop sit on top of each other, so the button morphs between them instead of
@@ -14788,6 +14921,42 @@ button.task-card-title:hover {
   padding: 0 10px;
   font-size: 12px;
 }
+/* The one move the card wants you to make: the accent's soft wash on the card's own tint,
+   not a loud filled pill; hover deepens it a touch and focus draws the app's ring. */
+.task-card-action.task-card-now {
+  background: var(--accent-wash);
+  color: var(--ink);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+.task-card-action.task-card-now:hover {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+.task-card-action.task-card-now:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* Its neighbour steps back: text-quiet, a wash only on hover. */
+.task-card-action.task-card-quiet {
+  background: transparent;
+  color: var(--ink-3);
+}
+.task-card-action.task-card-quiet:hover {
+  background: var(--tint-strong);
+  color: var(--ink);
+}
+.task-card-action.task-card-quiet:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.task-card-action:disabled {
+  opacity: 0.5;
+}
+
+/* A task card rides directly under the reply that opened it: the same 10px beat as any next
+   message in that burst, not the 22px a new speaker opens. */
+.chat-scroll .column > .turn.agent.task-turn {
+  margin-top: 0;
+}
 /* The consent card is the frame; the task card around it must not add a second one. */
 .task-card-await {
   display: grid;
@@ -15418,6 +15587,43 @@ button.task-card-title:hover {
 .status-card-status.failed {
   color: var(--danger);
 }
+/* A live lane's head is a button when it keeps a board: the whole line opens the items,
+   and the meter at its right is the same bar the chat's 进度 row draws. */
+.status-card-toggle {
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  border-radius: 6px;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+}
+.status-card-toggle:hover .status-card-title {
+  color: var(--ink);
+}
+.status-card-meter {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.status-card-bar {
+  flex: 0 0 64px;
+  min-width: 0;
+  max-width: 64px;
+}
+.status-card-count {
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+}
+.status-card-board {
+  padding: 6px 0 2px;
+}
 .task-card-dot.still {
   animation: none;
   opacity: 0.55;
@@ -15553,10 +15759,15 @@ button.task-card-title:hover {
   align-self: flex-start;
 }
 
+/* One sweep's width, shared by every shimmer (the card's line and border, the sheet's to-do in
+   progress). Defined at the root: a shimmer outside a card read it as undefined, which made its
+   background size and keyframe invalid, so the band stood still. */
+:root {
+  --shimmer-tile: 320px;
+}
+
 /* The card hugs its words, so the time sits next to the title instead of across the column. */
 .activity-card {
-  /* One sweep's width; the line and the border loop over it, so both move in step. */
-  --shimmer-tile: 320px;
   position: relative;
   overflow: hidden;
   align-self: flex-start;
@@ -15650,6 +15861,18 @@ button.task-card-title:hover {
   font-variant-numeric: tabular-nums;
   color: var(--ink-3);
 }
+/* A reply lane beside the bot's own work: the tag is what keeps the two cards apart. */
+.activity-card-tag {
+  flex: none;
+  align-self: center;
+  padding: 0 6px;
+  border-radius: 6px;
+  background: var(--accent-wash);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.7;
+}
 .activity-card-step {
   display: block;
   min-width: 0;
@@ -15675,7 +15898,9 @@ button.task-card-title:hover {
 /* The sweep is one repeating tile of fixed width that slides by exactly one tile per loop, so
    the last frame is the first: no jump back, no half band at the start. Pixel units keep the
    speed the same on a short line and a long one. */
-.activity-card-line.shimmer {
+.activity-card-line.shimmer,
+.todo-board-line.shimmer,
+.todo-row.doing .todo-text {
   background-image: linear-gradient(
     90deg,
     var(--ink-3) 0,
@@ -15766,6 +15991,14 @@ button.task-card-title:hover {
 }
 .activity-chip-turn {
   margin-top: 0;
+}
+
+/* A finished chip that stands in for an answer names the question it replies to, when the
+   user spoke again before it landed. Same line as a bubble's quote, outside any bubble. */
+.bubble-quote.activity-quote {
+  align-self: flex-start;
+  max-width: var(--reply-max, min(88%, 760px));
+  margin: 0;
 }
 
 /* ---- the detail sheet ----------------------------------------------------------------------
@@ -15867,6 +16100,106 @@ button.task-card-title:hover {
   font-size: 12.5px;
   color: var(--ink-3);
 }
+/* 进度: the working lane's own board, above the timeline, so a progress question reads first. */
+.activity-board {
+  margin: 0 0 16px;
+  display: grid;
+  gap: 6px;
+}
+.activity-board-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.activity-board-label {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--ink-2);
+}
+.activity-board-count {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+}
+.todo-board {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+}
+.todo-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+.todo-icon {
+  flex: none;
+  align-self: center;
+  display: inline-flex;
+  width: 13px;
+  color: var(--ink-3);
+}
+.todo-row.done .todo-icon {
+  color: var(--ok);
+}
+.todo-row.doing .todo-icon {
+  color: var(--accent);
+}
+.todo-text {
+  flex: 1;
+  min-width: 0;
+}
+.todo-row.done .todo-text {
+  color: var(--ink-3);
+}
+.todo-row.dropped .todo-text {
+  color: var(--ink-3);
+  text-decoration: line-through;
+}
+.todo-state {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+.todo-row.doing .todo-state {
+  color: var(--accent);
+}
+/* What the lane heard while it worked: quiet rows under its own board. */
+.activity-notes {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 6px 0 0;
+  border-top: 1px solid var(--hairline);
+  display: grid;
+  gap: 4px;
+}
+.activity-note {
+  display: flex;
+  gap: 8px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--ink-3);
+}
+.activity-note-kind {
+  flex: none;
+  opacity: 0.85;
+}
+.activity-note.request .activity-note-kind {
+  opacity: 1;
+  color: var(--accent);
+}
+.activity-note-text {
+  flex: 1;
+  min-width: 0;
+}
+
 .activity-divider {
   margin: 0 0 14px;
   border: 0;
@@ -16139,11 +16472,17 @@ button.task-card-title:hover {
     display: none;
   }
   .activity-card-line,
-  .activity-card-line.shimmer {
+  .activity-card-line.shimmer,
+  .todo-board-line.shimmer,
+  .todo-row.doing .todo-text {
     animation: none;
     background-image: none;
     -webkit-text-fill-color: currentColor;
     color: var(--ink-3);
+  }
+  /* The bar still moves to its new width; it just gets there without a slide. */
+  .todo-board-fill {
+    transition: none;
   }
 }
 

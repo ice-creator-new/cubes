@@ -21,7 +21,7 @@ from ..providers import DEFAULT_ENV_PROTOCOL, DEFAULT_ENV_PROVIDER_NAME, models_
 
 _UNSET = object()
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 LEGACY_SCHEMA_VERSION = 2
 BACKUP_SUFFIX = ".pre-team-backup.sqlite3"
 
@@ -123,6 +123,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         hops INTEGER NOT NULL DEFAULT 0,
         schedule_id TEXT,
         wrapped INTEGER NOT NULL DEFAULT 0,
+        lane TEXT NOT NULL DEFAULT 'work',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         finished_at TEXT
@@ -602,6 +603,35 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_activities_agent ON activities(agent_id, started_at)",
     "CREATE INDEX IF NOT EXISTS idx_activities_conversation ON activities(conversation_id)",
     "CREATE INDEX IF NOT EXISTS idx_activities_parent ON activities(parent_id, started_at)",
+    # v34: the progress board of one activity — a short to-do list the bot writes before it
+    # starts working and updates as it goes. The whole list is replaced at once, so ``idx``
+    # is only the display order.
+    """
+    CREATE TABLE IF NOT EXISTS activity_todos (
+        activity_id TEXT NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+        idx INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        status TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (activity_id, idx)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_activity_todos_activity ON activity_todos(activity_id, idx)",
+    # v34: something another lane told this one. A reply lane leaves a ``context`` note on
+    # every live work activity (what the user asked, how it was answered); a new
+    # requirement for ongoing work is a ``request`` note. It reaches the model at its next
+    # call boundary and is kept for the activity's detail page.
+    """
+    CREATE TABLE IF NOT EXISTS activity_notes (
+        id TEXT PRIMARY KEY,
+        activity_id TEXT NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        text TEXT NOT NULL,
+        source_message_id TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_activity_notes_activity ON activity_notes(activity_id, created_at)",
 )
 
 # Additive columns introduced after a table first shipped: a plain ``ALTER TABLE`` keeps
@@ -672,6 +702,8 @@ COLUMN_UPGRADES: dict[str, tuple[tuple[str, str], ...]] = {
         ("compactions", "INTEGER NOT NULL DEFAULT 0"),
         # v28: some bot's turn in this run stopped at its step budget, so 「继续」 resumes.
         ("wrapped", "INTEGER NOT NULL DEFAULT 0"),
+        # v34: ``work`` runs the actual job; ``reply`` answers a new user message beside it.
+        ("lane", "TEXT NOT NULL DEFAULT 'work'"),
     ),
     # v25: a group's own standing rules, read into every prompt in that group.
     "conversations": (("rules", "TEXT NOT NULL DEFAULT ''"),),
@@ -956,6 +988,9 @@ class Database:
                 # history, hidden from the sidebar and the chip list), never resumed.
                 if version < 32:
                     self._archive_reply_tasks(tx)
+                # v34: 「插进这一轮」 is gone; sends that meet a busy lane run beside it.
+                if version < 34:
+                    self._migrate_parallel_send_mode(tx)
                 if version < 12:
                     self._strip_echoed_digests(tx)
                 if legacy:
@@ -966,6 +1001,34 @@ class Database:
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     (str(SCHEMA_VERSION),),
                 )
+    @staticmethod
+    def _migrate_parallel_send_mode(tx: sqlite3.Connection) -> None:
+        """v34: ``steer`` becomes ``parallel`` for the team setting and every member.
+
+        The behaviour it named — a send joining the turn already running — no longer exists:
+        a send now runs in a lane of its own beside the work lane.
+        """
+        tx.execute(
+            "UPDATE agents SET send_mode = 'parallel', updated_at = ? WHERE send_mode = 'steer'",
+            (now_iso(),),
+        )
+        row = tx.execute(
+            "SELECT value FROM meta WHERE key = 'team_settings'"
+        ).fetchone()
+        if row is None or not row[0]:
+            return
+        try:
+            data = json.loads(row[0])
+        except (TypeError, ValueError):
+            return
+        if not isinstance(data, dict) or data.get("send_mode") != "steer":
+            return
+        data["send_mode"] = "parallel"
+        tx.execute(
+            "UPDATE meta SET value = ? WHERE key = 'team_settings'",
+            (json.dumps(data, ensure_ascii=False),),
+        )
+
     @staticmethod
     def _archive_reply_tasks(tx: sqlite3.Connection) -> None:
         """v32: plain-reply tasks become archived rows; every status is left as it was.
