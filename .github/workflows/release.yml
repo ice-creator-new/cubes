@@ -51,6 +51,26 @@ jobs:
             web/electron/build.log
             backend-build.log
 
+      - name: Smoke test (the app must survive its own launch)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            APP="web/electron/dist/mac-arm64/Cubes.app/Contents/MacOS/Cubes"
+          else
+            APP="web/electron/dist/win-unpacked/Cubes.exe"
+          fi
+          "$APP" &
+          APP_PID=$!
+          sleep 10
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            echo "app launched and is still alive"
+            kill "$APP_PID" 2>/dev/null || true
+          else
+            wait "$APP_PID"; code=$?
+            echo "app died on launch with exit code $code"
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: macos-dmg
@@ -119,6 +139,26 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::error::uname=$(uname -a) | uv=$(command -v uv || echo MISSING)"
           echo "::error::FULLLOG $(tail -c 2500 backend-build.log 2>/dev/null | tr '\n' '|')"
+
+      - name: Smoke test (the app must survive its own launch)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            APP="web/electron/dist/mac-arm64/Cubes.app/Contents/MacOS/Cubes"
+          else
+            APP="web/electron/dist/win-unpacked/Cubes.exe"
+          fi
+          "$APP" &
+          APP_PID=$!
+          sleep 10
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            echo "app launched and is still alive"
+            kill "$APP_PID" 2>/dev/null || true
+          else
+            wait "$APP_PID"; code=$?
+            echo "app died on launch with exit code $code"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

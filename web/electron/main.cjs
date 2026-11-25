@@ -12,7 +12,7 @@
 // CUBES_GLASS=0 drops the sidebar material (vibrancy, frosted or Liquid Glass) and transparency,
 // to measure that on its own.
 
-const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, net, os, protocol, shell } = require("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, net, protocol, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -278,19 +278,27 @@ handle("clear-remote", async () => {
   writeCliConfig(session);
   return describe();
 });
-/** The backdrop behind the web content: macOS vibrancy, Windows 11 acrylic, else a flat colour. */
+/** The backdrop behind the web content: macOS vibrancy, else a flat colour. Windows gets its
+ *  acrylic probed after creation (enableAcrylic) — the material needs Windows 11, and only the
+ *  system can say whether it is really there. */
 function windowMaterial() {
   const flat = { backgroundColor: nativeTheme.shouldUseDarkColors ? "#17181c" : "#f3f2f0" };
   if (!GLASS) return flat;
   if (process.platform === "darwin") {
     return { vibrancy: "sidebar", visualEffectState: "followWindow", backgroundColor: "#00000000" };
   }
-  // backgroundMaterial needs Windows 11 (build 22000+); Windows 10 keeps the flat backdrop.
-  const build = Number(os.release().split(".")[2] || 0);
-  if (process.platform === "win32" && build >= 22000) {
-    return { backgroundMaterial: "acrylic", backgroundColor: "#00000000" };
-  }
   return flat;
+}
+
+/** Windows 11 draws acrylic behind a transparent window; ask for it and only then give up the
+ *  flat backdrop. Where the material is missing (Windows 10), the flat colour simply stands. */
+function enableAcrylic() {
+  if (process.platform !== "win32" || !GLASS || !window) return;
+  try {
+    if (window.setBackgroundMaterial("acrylic")) window.setBackgroundColor("#00000000");
+  } catch {
+    /* no material API at all: the flat backdrop stands */
+  }
 }
 
 /** Windows: the caption buttons overlay the tab strip (there is no system title bar), tinted to
@@ -462,6 +470,7 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
+  enableAcrylic();
   // The saved material goes on before the first frame, so a launch never flashes the default.
   window.once("ready-to-show", () => {
     void applyGlass().finally(() => window?.show());
